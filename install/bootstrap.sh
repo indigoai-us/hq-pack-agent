@@ -69,22 +69,31 @@ resolve_token() {
 
 TOKEN="$(resolve_token)"
 
-if command -v git >/dev/null 2>&1 && [ -n "$TOKEN" ]; then
-  AUTH_URL="https://x-access-token:${TOKEN}@github.com/${RELEASE_REPO}.git"
+if command -v git >/dev/null 2>&1; then
+  # The token is OPTIONAL (the repo is PUBLIC). With a token we use an
+  # authenticated remote kept ONLY in-process (scrubbed from disk right after);
+  # without one we clone/fetch UNAUTHENTICATED over the public URL. The clean
+  # public URL is what remains in .git/config either way.
+  PUBLIC_URL="https://github.com/${RELEASE_REPO}.git"
+  if [ -n "$TOKEN" ]; then
+    AUTH_URL="https://x-access-token:${TOKEN}@github.com/${RELEASE_REPO}.git"
+  else
+    AUTH_URL="$PUBLIC_URL"
+  fi
   if [ -d "$REPO_DIR/.git" ]; then
     log "pulling latest into existing checkout"
     git -C "$REPO_DIR" remote set-url origin "$AUTH_URL" >/dev/null 2>&1
     git -C "$REPO_DIR" fetch --tags --force origin >/dev/null 2>&1
     git -C "$REPO_DIR" reset --hard origin/HEAD >/dev/null 2>&1 || true
-    git -C "$REPO_DIR" remote set-url origin "https://github.com/${RELEASE_REPO}.git" >/dev/null 2>&1
+    git -C "$REPO_DIR" remote set-url origin "$PUBLIC_URL" >/dev/null 2>&1
   else
-    log "cloning private repo"
+    log "cloning repo${TOKEN:+ (authenticated)}"
     rm -rf "$REPO_DIR" 2>/dev/null
     git clone --depth 1 "$AUTH_URL" "$REPO_DIR" >/dev/null 2>&1
-    [ -d "$REPO_DIR/.git" ] && git -C "$REPO_DIR" remote set-url origin "https://github.com/${RELEASE_REPO}.git" >/dev/null 2>&1
+    [ -d "$REPO_DIR/.git" ] && git -C "$REPO_DIR" remote set-url origin "$PUBLIC_URL" >/dev/null 2>&1
   fi
 else
-  log "no git/auth available; will install from an existing checkout if present"
+  log "git unavailable; will install from an existing checkout if present"
 fi
 
 # Choose install source: the fetched checkout, else a checkout already present,

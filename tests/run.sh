@@ -6,7 +6,8 @@
 #   * is-agent detection precedence (force flags, markers, default-inert)
 #   * updater: local<remote triggers; equal/greater does not; TTL throttle;
 #     cache-delete forces re-check
-#   * auth: missing creds -> silent no-op (exit 0, no token in output/log)
+#   * auth: NO token still updates (public repo, unauthenticated); nothing-to-
+#     fetch is a graceful no-op; a token (when present) never leaks to output/log
 #   * rollback: a release whose install.sh fails rolls back to the prior version
 #   * idempotency: install twice -> identical settings
 #   * uninstall: full inverse, host byte-identical
@@ -55,7 +56,17 @@ if [ "$1" = "secrets" ] && [ "$2" = "get" ]; then
 fi
 exit 1
 EOF
-  chmod +x "$bin/gh" "$bin/hq"
+  # Hermetic curl: the updater's unauthenticated fallback hits GitHub's
+  # releases/latest — stub it (mirrors the gh stub via FAKE_GH_TAG) so tests
+  # never touch the network (a real fetch would find the actual latest release).
+  cat > "$bin/curl" <<'EOF'
+#!/bin/bash
+case "$*" in
+  *"releases/latest"*) [ -n "${FAKE_GH_TAG:-}" ] && { printf '{"tag_name":"%s"}\n' "$FAKE_GH_TAG"; exit 0; } || exit 1 ;;
+  *) exit 1 ;;
+esac
+EOF
+  chmod +x "$bin/gh" "$bin/hq" "$bin/curl"
 }
 
 echo "== is-agent detection =="
@@ -104,14 +115,22 @@ run_updater() { # env-configured; returns stdout. stdin from /dev/null so the
     unset GH_TOKEN GITHUB_TOKEN
     "$@" bash "$PKG/hooks/agent-pack-update.sh" </dev/null 2>/dev/null )
 }
-# (a) no auth -> silent no-op, exit 0, cache notes no-auth, no token anywhere
-rm -f "$R1/workspace/.hq-pack-agent/last-check.json"
-out="$(FAKE_GH_AUTH=0 FAKE_HQ_SECRET= run_updater env)"; rc=$?
-assert_eq "updater no-auth exits 0" "$rc" "0"
-assert_not_contains "updater no-auth emits no update banner" "$out" "hq-pack-agent-update"
-assert_contains "updater no-auth stamps cache note" "$(cat "$R1/workspace/.hq-pack-agent/last-check.json" 2>/dev/null)" "no-auth"
+# (a) TOKENLESS PUBLIC UPDATE: no token resolves, but the repo is PUBLIC, so a
+# newer release is still fetched UNAUTHENTICATED and triggers the update. This is
+# the crux of the tokenless relaxation.
+printf '#!/bin/bash\nexit 0\n' > "$BIN/git"; chmod +x "$BIN/git"   # detached child no-ops
+rm -f "$R1/workspace/.hq-pack-agent/last-check.json" "$R1/workspace/.hq-pack-agent/update.stamp"
+out="$(FAKE_GH_AUTH=0 FAKE_HQ_SECRET= FAKE_GH_TAG=v9.9.9 run_updater env)"; rc=$?
+assert_eq "updater tokenless-public exits 0" "$rc" "0"
+assert_contains "updater tokenless-public: newer public release triggers (banner)" "$out" "hq-pack-agent-update"
+assert_file "$R1/workspace/.hq-pack-agent/update.stamp" "updater tokenless-public: writes cooldown stamp"
 assert_not_contains "no token leaks to updater stdout" "$out" "faketoken"
 assert_not_contains "no token leaks to debug log" "$(cat "$R1/workspace/.hq-pack-agent/debug.log" 2>/dev/null)" "faketoken"
+# (a2) no token AND nothing resolvable (public fetch yields no tag) -> graceful no-op
+rm -f "$R1/workspace/.hq-pack-agent/last-check.json" "$R1/workspace/.hq-pack-agent/update.stamp"
+out="$(FAKE_GH_AUTH=0 FAKE_HQ_SECRET= run_updater env)"; rc=$?
+assert_eq "updater no-tag exits 0" "$rc" "0"
+assert_not_contains "updater no-tag: no banner when nothing resolves" "$out" "hq-pack-agent-update"
 # (b) auth + equal version -> no update
 rm -f "$R1/workspace/.hq-pack-agent/last-check.json" "$R1/workspace/.hq-pack-agent/update.stamp"
 out="$(FAKE_GH_AUTH=1 FAKE_GH_TAG=v0.1.0 run_updater env)"

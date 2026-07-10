@@ -8,8 +8,8 @@
 #   1. Gate on agent-only (handled by agent-pack-gate.sh, but we re-check so the
 #      hook is safe even if invoked directly).
 #   2. Throttle: 24h TTL cache in workspace/.hq-pack-agent/last-check.json.
-#   3. Resolve auth for the PRIVATE repo (hq-vault deploy token, else gh auth).
-#      Missing/invalid auth -> silent no-op (exit 0), never a prompt.
+#   3. Resolve auth for the repo (optional; public) (hq-vault deploy token, else gh auth).
+#      No token needed (repo is PUBLIC) — fetch unauthenticated. Never a prompt.
 #   4. Compare installed VERSION to the latest GitHub Release tag (semver).
 #   5. If newer, spawn a fully DETACHED background updater that pulls the release
 #      and re-runs install.sh, backing up the current version first and rolling
@@ -71,8 +71,8 @@ fi
 #   (a) hq-vault secret via `hq secrets get` (preferred).
 #   (b) GH_TOKEN / GITHUB_TOKEN already in the environment.
 #   (c) `gh auth token` from an authenticated gh.
-# If none resolve -> silent no-op. We stamp the cache so we don't retry every
-# session on a box that simply has no agent-update auth.
+# None resolving is FINE — the repo is public, so we fetch UNAUTHENTICATED.
+# A token, when present, is only an optimization (private fallback + rate limit).
 resolve_token() {
   local t=""
   if command -v hq >/dev/null 2>&1; then
@@ -88,26 +88,34 @@ resolve_token() {
   return 1
 }
 
-TOKEN="$(resolve_token)"
-if [ -z "$TOKEN" ]; then
-  hqpa_log "update-check: no private-repo auth available; no-op"
-  # Stamp so we honor the TTL and don't hammer this path every session.
-  printf '{"latest":"","checkedAt":"%s","note":"no-auth"}\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo '?')" > "$CACHE_FILE" 2>/dev/null || true
-  exit 0
-fi
+# A token is OPTIONAL now that indigoai-us/hq-pack-agent is PUBLIC: an empty
+# TOKEN means "fetch/clone UNAUTHENTICATED", which works for a public repo. A
+# token is still USED when present (kept as a fallback if the repo ever goes
+# private again, and it raises GitHub's API rate limit). So we never no-op just
+# for lack of a token -- we proceed with an unauthenticated public fetch.
+TOKEN="$(resolve_token)" || TOKEN=""
 
-# (4) Fetch latest release tag using the token, WITHOUT exposing it. We pass the
-# token via GH_TOKEN to a gh subshell (env, not argv) or via an Authorization
-# header to curl (header, not URL). No token ever reaches stdout or the log.
+# (4) Fetch latest release tag. When a token is present it is passed via GH_TOKEN
+# (env, not argv) / an Authorization header (never a URL) and never echoed; when
+# absent we fetch UNAUTHENTICATED (public repo).
 fetch_latest_tag() {
   if command -v gh >/dev/null 2>&1; then
-    GH_TOKEN="$TOKEN" gh release view -R "$RELEASE_REPO" --json tagName -q .tagName 2>/dev/null && return 0
+    if [ -n "$TOKEN" ]; then
+      GH_TOKEN="$TOKEN" gh release view -R "$RELEASE_REPO" --json tagName -q .tagName 2>/dev/null && return 0
+    else
+      gh release view -R "$RELEASE_REPO" --json tagName -q .tagName 2>/dev/null && return 0
+    fi
   fi
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL -H "Authorization: Bearer $TOKEN" \
-      "https://api.github.com/repos/$RELEASE_REPO/releases/latest" 2>/dev/null \
-      | sed -nE 's/.*"tag_name":[[:space:]]*"([^"]+)".*/\1/p' | head -1 && return 0
+    if [ -n "$TOKEN" ]; then
+      curl -fsSL -H "Authorization: Bearer $TOKEN" \
+        "https://api.github.com/repos/$RELEASE_REPO/releases/latest" 2>/dev/null \
+        | sed -nE 's/.*"tag_name":[[:space:]]*"([^"]+)".*/\1/p' | head -1 && return 0
+    else
+      curl -fsSL \
+        "https://api.github.com/repos/$RELEASE_REPO/releases/latest" 2>/dev/null \
+        | sed -nE 's/.*"tag_name":[[:space:]]*"([^"]+)".*/\1/p' | head -1 && return 0
+    fi
   fi
   return 1
 }

@@ -49,12 +49,19 @@ fi
 
 log "starting update -> ${TARGET_VERSION:-unknown} (repo=$RELEASE_REPO)"
 
-[ -n "$TOKEN" ] || { log "no token in env; aborting"; exit 0; }
 command -v git >/dev/null 2>&1 || { log "git missing; aborting"; exit 0; }
 
-# Authenticated remote URL kept ONLY in-process (never persisted to git config,
-# so the token can't leak via .git/config on disk).
-AUTH_URL="https://x-access-token:${TOKEN}@github.com/${RELEASE_REPO}.git"
+# The token is OPTIONAL (the repo is PUBLIC). With a token we use an
+# authenticated remote (kept ONLY in-process, never persisted to git config, so
+# it can't leak via .git/config); without one we clone/fetch UNAUTHENTICATED
+# over the plain public URL. The clean public URL is what stays on disk either
+# way (see the set-url scrub below).
+PUBLIC_URL="https://github.com/${RELEASE_REPO}.git"
+if [ -n "$TOKEN" ]; then
+  AUTH_URL="https://x-access-token:${TOKEN}@github.com/${RELEASE_REPO}.git"
+else
+  AUTH_URL="$PUBLIC_URL"
+fi
 
 # --- Back up the current install so we can roll back. ---
 CURRENT_VERSION="$(head -1 "$STATE_DIR/installed-version" 2>/dev/null | tr -dc '0-9.')"
