@@ -220,6 +220,17 @@ email   corey@corp.com  read        prs_X       knowledge/*  2026-05-20
 company-wide  Everyone in company  read  prs_X  knowledge/*  2026-06-01
 A
     ;;
+    root-shadow)
+cat <<'A'
+ACL for knowledge/readme.md (restricted)
+No direct ACL row — access flows from the inherited/descendant grants below.
+
+Inherited (granted on an ancestor prefix):
+TYPE   GRANTEE         PERMISSION  GRANTED_BY  SOURCE       GRANTED_AT
+email  jacob@corp.com  read        prs_X       *            2026-05-20
+email  corey@corp.com  read        prs_X       knowledge/*  2026-07-10
+A
+    ;;
     open)
 cat <<'A'
 ACL for knowledge/z.md (open)
@@ -253,6 +264,11 @@ RE="$(new_root slackenv)"; mkdir -p "$RE/workspace/.hq-pack-agent"
 ENVOUT="$(printf '' | env HQ_PACK_AGENT_FORCE_AGENT=1 "HQ_PACK_AGENT_HQ_ROOT=$RE" HQ_SLACK_CHANNEL_NAME=envchan HQ_SLACK_SENDER_EMAIL=env-sender@corp.com "HQ_SLACK_MEMBER_EMAILS=a@corp.com, b@corp.com" bash "$PKG/hooks/agent-slack-context.sh" 2>/dev/null)"
 assert_contains "slack-context(env): sender from env" "$ENVOUT" "env-sender@corp.com"
 assert_contains "slack-context(env): members from env list" "$ENVOUT" "b@corp.com"
+# F17 precedence: an explicit HQ_SLACK_CONTEXT_FILE beats conflicting env values
+printf '%s' '{"channel":{"name":"filechan"},"sender":{"email":"fileuser@corp.com"},"members":[{"email":"fileuser@corp.com"}]}' > "$RE/ctx.json"
+PREC="$(printf '' | env HQ_PACK_AGENT_FORCE_AGENT=1 "HQ_PACK_AGENT_HQ_ROOT=$RE" "HQ_SLACK_CONTEXT_FILE=$RE/ctx.json" HQ_SLACK_CHANNEL_NAME=envchan HQ_SLACK_SENDER_EMAIL=envuser@corp.com bash "$PKG/hooks/agent-slack-context.sh" 2>/dev/null)"
+assert_contains "precedence: explicit file beats env" "$PREC" "#filechan"
+assert_not_contains "precedence: env ignored when explicit file present" "$PREC" "envchan"
 
 echo "== company-file-access: winner-only (most-specific) + safety fallbacks =="
 fa() { printf '%s' "{\"tool_input\":{\"file_path\":\"$3\"}}" | env "PATH=$SBIN:$PATH" "$1" "ACL_MODE=$2" "HQ_PACK_AGENT_HQ_ROOT=$RS" "CLAUDE_PROJECT_DIR=$RS" bash "$PKG/hooks/agent-company-file-access.sh" 2>/dev/null; }
@@ -277,6 +293,16 @@ assert_contains "inherited-winner: guest (outsider) flagged do-not-share" "$IO" 
 clearcache; OO="$(fa HQ_PACK_AGENT_FORCE_AGENT=1 open "$RS/companies/acme/knowledge/z.md")"
 assert_contains "open-acl: company member jacob has access" "$OO" "jacob@corp.com"
 assert_contains "open-acl: outsider guest flagged do-not-share" "$OO" "DO NOT share"
+
+# real-format most-specific: knowledge/* wins, root-* grant is SHADOWED (leak guard)
+clearcache; RSH="$(fa HQ_PACK_AGENT_FORCE_AGENT=1 root-shadow "$RS/companies/acme/knowledge/readme.md")"
+WITHSEC="$(printf '%s' "$RSH" | sed -n '/WITH access/,/WITHOUT/p')"
+case "$WITHSEC" in *jacob*) bad "root-shadow: root-* grantee jacob wrongly WITH access";; *corey*) ok "root-shadow: only knowledge/* grantee corey is WITH; root-* jacob shadowed";; *) bad "root-shadow: unexpected WITH section";; esac
+assert_contains "root-shadow: shadowed jacob triggers do-not-share" "$RSH" "DO NOT share"
+# empty ACL output -> conservative, never all-clear
+clearcache; EO="$(fa HQ_PACK_AGENT_FORCE_AGENT=1 empty "$RS/companies/acme/knowledge/x.md")"
+assert_contains "empty-acl: conservative could-not-resolve" "$EO" "Could not resolve"
+assert_not_contains "empty-acl: never claims all-clear" "$EO" "All current channel members"
 
 # scope/session guards
 clearcache; assert_eq "file-access: non-company path is silent" "$(fa HQ_PACK_AGENT_FORCE_AGENT=1 direct-shadow "$RS/core/x.md")" ""

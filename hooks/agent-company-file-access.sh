@@ -140,14 +140,26 @@ for line in members_raw.splitlines():
 # source prefix: Direct rows implicitly target REL (most specific); Inherited rows
 # carry an explicit SOURCE column.
 def specificity(src):
-    s = src.rstrip("/")
-    glob = 1 if s.endswith("/*") else 0
+    # Higher tuple = MORE specific. The root ("*" or "") matches everything and is
+    # the LEAST specific — it must never outrank a folder prefix, or a broad
+    # `*`-scoped grant would shadow-win over the real most-specific ACL and
+    # over-grant access (a leak). Mirrors hq-pro patternSpecificity ordering.
+    s = (src or "").strip().rstrip("/")
+    if s in ("", "*"):
+        return (-1, 0)
+    glob = s.endswith("/*")
     base = s[:-2] if glob else s
-    return (base.count("/"), 0 if glob else 1)   # deeper wins; exact beats glob
+    return (base.count("/") + 1, 0 if glob else 1)   # deeper wins; exact beats glob
 
 rows = []                 # (source, type, grantee)
 section = None
-acl_open = "(open)" in acl or "Open ACL" in acl.lower() or "all active members have read" in acl.lower()
+import re as _re
+acl_open = False
+for _ln in acl.splitlines():
+    _l = _ln.strip()
+    if _re.match(r"^ACL for .*\(open\)\s*$", _l) or _l.lower().startswith("open acl"):
+        acl_open = True
+        break
 for line in acl.splitlines():
     s = line.strip()
     ls = s.lower()
