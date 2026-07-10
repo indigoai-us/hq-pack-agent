@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+# run.sh — hq-pack-agent test suite (no shortcuts; real regression coverage).
+#
+# Covers every acceptance requirement from the build spec:
+#   * agent-gate: no-op for human sessions, active for agent sessions
+#   * is-agent detection precedence (force flags, markers, default-inert)
+#   * updater: local<remote triggers; equal/greater does not; TTL throttle;
+#     cache-delete forces re-check
+#   * auth: missing creds -> silent no-op (exit 0, no token in output/log)
+#   * rollback: a release whose install.sh fails rolls back to the prior version
+#   * idempotency: install twice -> identical settings
+#   * uninstall: full inverse, host byte-identical
+#   * markdown-strip transform: input -> expected plain output
+#
+# Runs hermetically in a temp HQ root with stubbed gh/hq/git on PATH. No network,
+# never touches the real host HQ.
+
+PKG="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/hqpa-tests.XXXXXX")"
+trap 'rm -rf "$TMP"' EXIT
+
+PASS=0; FAIL=0
+ok()   { PASS=$((PASS+1)); printf '  \033[32mPASS\033[0m %s\n' "$1"; }
+bad()  { FAIL=$((FAIL+1)); printf '  \033[31mFAIL\033[0m %s\n' "$1"; [ -n "${2:-}" ] && printf '        %s\n' "$2"; }
+assert_contains()     { case "$2" in *"$3"*) ok "$1";; *) bad "$1" "expected to contain: $3 | got: $2";; esac; }
+assert_not_contains() { case "$2" in *"$3"*) bad "$1" "expected NOT to contain: $3 | got: $2";; *) ok "$1";; esac; }
+assert_eq()           { [ "$2" = "$3" ] && ok "$1" || bad "$1" "expected '$3' got '$2'"; }
+assert_file()         { [ -f "$1" ] && ok "$2" || bad "$2" "missing file: $1"; }
+assert_nofile()       { [ ! -e "$1" ] && ok "$2" || bad "$2" "file should not exist: $1"; }
+
+# --- fresh temp HQ root ---
+new_root() {
+  local r="$TMP/hq-$1"
+  mkdir -p "$r/.claude" "$r/workspace"
+  printf '%s' "$r"
+}
+
+# --- build a stub-bin dir; caller sets FAKE_* env before invoking targets ---
+make_stubs() {
+  local bin="$1"; mkdir -p "$bin"
+  cat > "$bin/gh" <<'EOF'
+#!/bin/bash
+case "$*" in
+  "auth status") [ "${FAKE_GH_AUTH:-0}" = "1" ] && exit 0 || exit 1 ;;
+  "auth token")  [ "${FAKE_GH_AUTH:-0}" = "1" ] && { echo "ghp_FAKEfaketoken000000000000000000000000"; exit 0; } || exit 1 ;;
+  *"release view"*) [ -n "${FAKE_GH_TAG:-}" ] && { echo "$FAKE_GH_TAG"; exit 0; } || exit 1 ;;
+  *) exit 1 ;;
+esac
+EOF
+  cat > "$bin/hq" <<'EOF'
+#!/bin/bash
+if [ "$1" = "secrets" ] && [ "$2" = "get" ]; then
+  [ -n "${FAKE_HQ_SECRET:-}" ] && { printf '%s\n' "$FAKE_HQ_SECRET"; exit 0; }
+  exit 0
+fi
+exit 1
+EOF
+  chmod +x "$bin/gh" "$bin/hq"
+}
+
+echo "== is-agent detection =="
+(
+  . "$PKG/install/lib/is-agent.sh"
+  out=""
+  HQ_PACK_AGENT_FORCE_AGENT=1 hq_is_agent_session && out=agent || out=human
+  assert_eq "force-agent -> agent" "$out" "agent"
+  HQ_PACK_AGENT_FORCE_HUMAN=1 HQ_PACK_AGENT_FORCE_AGENT=1 hq_is_agent_session && out=agent || out=human
+  assert_eq "force-human overrides force-agent" "$out" "human"
+  ( unset HQ_PACK_AGENT_FORCE_AGENT HQ_PACK_AGENT_FORCE_HUMAN HQ_AGENT_SESSION HQ_AGENT_SLUG
+    hq_is_agent_session ) && out=agent || out=human
+  assert_eq "no signal -> default human (inert)" "$out" "human"
+  ( HQ_AGENT_SLUG=slackbot hq_is_agent_session ) && out=agent || out=human
+  assert_eq "agent-slug env -> agent" "$out" "agent"
+)
+
+echo "== agent-pack-gate: human no-op / agent active =="
+DELEG="$TMP/deleg.sh"; printf '#!/bin/bash\ncat >/dev/null 2>&1\necho RAN_DELEGATE\n' > "$DELEG"; chmod +x "$DELEG"
+out_h="$(echo '{}' | HQ_PACK_AGENT_FORCE_HUMAN=1 bash "$PKG/hooks/agent-pack-gate.sh" demo "$DELEG" 2>/dev/null)"
+assert_not_contains "gate: human session does not run delegate" "$out_h" "RAN_DELEGATE"
+out_a="$(echo '{}' | HQ_PACK_AGENT_FORCE_AGENT=1 bash "$PKG/hooks/agent-pack-gate.sh" demo "$DELEG" 2>/dev/null)"
+assert_contains "gate: agent session runs delegate" "$out_a" "RAN_DELEGATE"
+out_d="$(echo '{}' | HQ_PACK_AGENT_FORCE_AGENT=1 HQ_PACK_AGENT_DISABLED_HOOKS=demo bash "$PKG/hooks/agent-pack-gate.sh" demo "$DELEG" 2>/dev/null)"
+assert_not_contains "gate: disabled hook is skipped" "$out_d" "RAN_DELEGATE"
+
+echo "== markdown-strip transform =="
+. "$PKG/hooks/lib/markdown-strip.sh"
+IN=$'# Heading\nThis is **bold** and `code` and _em_.\nSee [docs](https://x.io)\n```bash\nls\n```'
+STRIP="$(printf '%s' "$IN" | hqpa_markdown_strip)"
+assert_not_contains "strip removes bold markers" "$STRIP" "**"
+assert_not_contains "strip removes backticks" "$STRIP" '`'
+assert_not_contains "strip removes heading hashes" "$STRIP" "# Heading"
+assert_contains "strip keeps heading words" "$STRIP" "Heading"
+assert_contains "strip converts link to text (url)" "$STRIP" "docs (https://x.io)"
+STRIP2="$(printf '%s' "$STRIP" | hqpa_markdown_strip)"
+assert_eq "strip is idempotent" "$STRIP2" "$STRIP"
+
+echo "== updater: auth resolution + version decisions =="
+R1="$(new_root updater)"; BIN="$TMP/bin-updater"; make_stubs "$BIN"
+mkdir -p "$R1/workspace/.hq-pack-agent"; printf '0.1.0\n' > "$R1/workspace/.hq-pack-agent/installed-version"
+run_updater() { # env-configured; returns stdout. stdin from /dev/null so the
+                # hook's `cat` sees EOF immediately (in production the master-hook
+                # closes stdin; a test pipe would otherwise block it).
+  ( export PATH="$BIN:$PATH" HQ_PACK_AGENT_HQ_ROOT="$R1" HQ_PACK_AGENT_FORCE_AGENT=1
+    unset GH_TOKEN GITHUB_TOKEN
+    "$@" bash "$PKG/hooks/agent-pack-update.sh" </dev/null 2>/dev/null )
+}
+# (a) no auth -> silent no-op, exit 0, cache notes no-auth, no token anywhere
+rm -f "$R1/workspace/.hq-pack-agent/last-check.json"
+out="$(FAKE_GH_AUTH=0 FAKE_HQ_SECRET= run_updater env)"; rc=$?
+assert_eq "updater no-auth exits 0" "$rc" "0"
+assert_not_contains "updater no-auth emits no update banner" "$out" "hq-pack-agent-update"
+assert_contains "updater no-auth stamps cache note" "$(cat "$R1/workspace/.hq-pack-agent/last-check.json" 2>/dev/null)" "no-auth"
+assert_not_contains "no token leaks to updater stdout" "$out" "faketoken"
+assert_not_contains "no token leaks to debug log" "$(cat "$R1/workspace/.hq-pack-agent/debug.log" 2>/dev/null)" "faketoken"
+# (b) auth + equal version -> no update
+rm -f "$R1/workspace/.hq-pack-agent/last-check.json" "$R1/workspace/.hq-pack-agent/update.stamp"
+out="$(FAKE_GH_AUTH=1 FAKE_GH_TAG=v0.1.0 run_updater env)"
+assert_not_contains "updater equal-version: no banner" "$out" "hq-pack-agent-update"
+assert_nofile "$R1/workspace/.hq-pack-agent/update.stamp" "updater equal-version: no update stamp"
+# (c) auth + newer version -> triggers (banner + cooldown stamp)
+rm -f "$R1/workspace/.hq-pack-agent/last-check.json" "$R1/workspace/.hq-pack-agent/update.stamp"
+# git stub so the detached updater child does nothing real
+printf '#!/bin/bash\nexit 0\n' > "$BIN/git"; chmod +x "$BIN/git"
+out="$(FAKE_GH_AUTH=1 FAKE_GH_TAG=v9.9.9 run_updater env)"
+assert_contains "updater newer-version: emits banner" "$out" "hq-pack-agent-update"
+assert_file "$R1/workspace/.hq-pack-agent/update.stamp" "updater newer-version: writes cooldown stamp"
+# (d) TTL throttle: fresh cache -> no work
+printf '{"latest":"9.9.9"}' > "$R1/workspace/.hq-pack-agent/last-check.json"
+rm -f "$R1/workspace/.hq-pack-agent/update.stamp"
+out="$(FAKE_GH_AUTH=1 FAKE_GH_TAG=v9.9.9 run_updater env)"
+assert_not_contains "updater TTL throttle: no banner when cache fresh" "$out" "hq-pack-agent-update"
+assert_nofile "$R1/workspace/.hq-pack-agent/update.stamp" "updater TTL throttle: no work when cache fresh"
+# (e) cache-delete forces re-check
+rm -f "$R1/workspace/.hq-pack-agent/last-check.json"
+FAKE_GH_AUTH=1 FAKE_GH_TAG=v0.1.0 run_updater env >/dev/null 2>&1
+assert_file "$R1/workspace/.hq-pack-agent/last-check.json" "updater: cache re-created after delete"
+
+echo "== do-update rollback =="
+R2="$(new_root rollback)"; ST="$R2/workspace/.hq-pack-agent"; mkdir -p "$ST/repo/install"
+printf '0.1.0\n' > "$ST/installed-version"
+# GOOD install.sh (currently checked out): records that GOOD ran, exit 0
+cat > "$ST/repo/install/install.sh" <<'EOF'
+#!/bin/bash
+echo GOOD > "$HQ_PACK_AGENT_HQ_ROOT/workspace/.hq-pack-agent/which-install"
+exit 0
+EOF
+mkdir -p "$ST/repo/.git"
+BIN2="$TMP/bin-rollback"; mkdir -p "$BIN2"
+# git stub: on checkout/reset, simulate pulling a BAD release (install.sh fails)
+cat > "$BIN2/git" <<'EOF'
+#!/bin/bash
+if [ "$1" = "-C" ]; then D="$2"; SUB="$3"; else SUB="$1"; D=""; fi
+case "$SUB" in
+  checkout|reset) [ -n "$D" ] && { mkdir -p "$D/install"; printf '#!/bin/bash\nexit 1\n' > "$D/install/install.sh"; }; exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+chmod +x "$BIN2/git"
+( export PATH="$BIN2:$PATH"
+  HQ_PACK_AGENT_HQ_ROOT="$R2" HQ_PACK_AGENT_RELEASE_REPO="indigoai-us/hq-pack-agent" \
+  HQ_PACK_AGENT_UPDATE_TOKEN="ghp_FAKEfaketoken0000000000000000000000" \
+  bash "$PKG/install/do-update.sh" 9.9.9 >/dev/null 2>&1 )
+assert_eq "rollback: GOOD (prior) install.sh ran after bad release" "$(cat "$ST/which-install" 2>/dev/null)" "GOOD"
+assert_not_contains "rollback: no token in debug log" "$(cat "$ST/debug.log" 2>/dev/null)" "faketoken"
+
+echo "== install idempotency + uninstall byte-identical (fresh host) =="
+R3="$(new_root fresh)"
+assert_nofile "$R3/.claude/settings.local.json" "precondition: no settings.local.json"
+HQ_PACK_AGENT_HQ_ROOT="$R3" bash "$PKG/install/install.sh" >/dev/null 2>&1
+assert_file "$R3/.claude/settings.local.json" "install: creates settings.local.json"
+FIRST="$(cat "$R3/.claude/settings.local.json")"
+HQ_PACK_AGENT_HQ_ROOT="$R3" bash "$PKG/install/install.sh" >/dev/null 2>&1
+SECOND="$(cat "$R3/.claude/settings.local.json")"
+assert_eq "install is idempotent (identical settings twice)" "$SECOND" "$FIRST"
+assert_contains "install wired the gate into settings" "$FIRST" "agent-pack-gate.sh"
+HQ_PACK_AGENT_HQ_ROOT="$R3" bash "$PKG/install/uninstall.sh" >/dev/null 2>&1
+assert_nofile "$R3/.claude/settings.local.json" "uninstall: removes settings.local.json (byte-identical absence)"
+assert_nofile "$R3/workspace/.hq-pack-agent" "uninstall: removes package state dir"
+
+echo "== uninstall preserves pre-existing user settings (byte-identical) =="
+R4="$(new_root preexisting)"
+printf '{\n  "env": {\n    "FOO": "bar"\n  }\n}\n' > "$R4/.claude/settings.local.json"
+ORIG="$(cat "$R4/.claude/settings.local.json")"
+HQ_PACK_AGENT_HQ_ROOT="$R4" bash "$PKG/install/install.sh" >/dev/null 2>&1
+assert_contains "install: user's pre-existing key survives" "$(cat "$R4/.claude/settings.local.json")" "\"FOO\""
+HQ_PACK_AGENT_HQ_ROOT="$R4" bash "$PKG/install/uninstall.sh" >/dev/null 2>&1
+assert_eq "uninstall: restores pre-existing settings byte-identical" "$(cat "$R4/.claude/settings.local.json")" "$ORIG"
+
+echo
+echo "== $PASS passed, $FAIL failed =="
+[ "$FAIL" -eq 0 ]

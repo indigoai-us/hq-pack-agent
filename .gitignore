@@ -1,0 +1,6 @@
+# transient test scratch
+tests/tmp/
+# never commit auth material or local state
+*.token
+workspace/
+.DS_Store

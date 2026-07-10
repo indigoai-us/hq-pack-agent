@@ -1,0 +1,27 @@
+{
+  "name": "hq-agent",
+  "description": "Agent-only HQ behavior package. Private distribution — installs into an HQ agent's local overlay and self-updates from indigoai-us/hq-pack-agent releases.",
+  "owner": {
+    "name": "Indigo / HQ"
+  },
+  "plugins": [
+    {
+      "name": "hq-agent",
+      "source": "./",
+      "description": "Agent-only hooks, policies, and skills for HQ agents (Slack / email / cloud workers). Inert in human sessions; self-updating from its own private release.",
+      "version": "0.1.0",
+      "author": {
+        "name": "Indigo / HQ",
+        "url": "https://github.com/indigoai-us"
+      },
+      "license": "UNLICENSED",
+      "keywords": [
+        "hq",
+        "agent",
+        "hooks",
+        "policies",
+        "self-updating"
+      ]
+    }
+  ]
+}

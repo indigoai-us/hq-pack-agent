@@ -1,0 +1,32 @@
+name: hq-pack-agent
+version: 0.1.0
+publisher: '@indigoai-us'
+access: private
+description: >-
+  Agent-only behavior for HQ. Ships hooks, policies, and skills that activate
+  ONLY in genuine HQ agent sessions (Slack / email / cloud workers) and stay
+  completely inert in human HQ sessions. Carries its own SessionStart self-update
+  hook so a single GitHub Release of indigoai-us/hq-pack-agent rolls new agent
+  behavior to every agent on its next session — no hq-core change, no per-company
+  edit. Install is idempotent and fully reversible (byte-identical uninstall);
+  the host core settings.json is never touched (registration lands in the local
+  settings overlay). All hooks are advisory-only, trap-exit-0, and self-gate on
+  agent detection, so a failed update or missing private-repo auth degrades to a
+  silent no-op rather than a blocked session.
+requires:
+  hqCore: '>=15.0.0'
+  # Runtime prerequisites (agent host):
+  #   - bash + awk (POSIX) for the hooks
+  #   - `gh` CLI OR an `hq`-vault deploy token for private-repo updates (optional;
+  #     absent → updater is a silent no-op, package still runs the installed version)
+  #   - git for clone/pull of the private source repo
+repo: indigoai-us/hq-pack-agent   # PRIVATE — source + release origin
+# NOTE: this package intentionally does NOT declare `contributes:` for
+# scan-packages.sh. scan-packages wires content for the WHOLE host population
+# (human users included); this package must stay agent-only, so it wires itself
+# through install/install.sh into the *local* settings overlay + package-owned
+# gate instead. See README.md ("Why not scan-packages / contributes").
+selfUpdate:
+  releaseRepo: indigoai-us/hq-pack-agent
+  authSecret: HQ_PACK_AGENT_DEPLOY_TOKEN   # hq-vault secret name (never committed)
+  checkTtlSeconds: 86400                    # 24h throttle, mirrors check-hq-update.sh
