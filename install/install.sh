@@ -92,13 +92,14 @@ NEW_JSON="$(printf '%s' "$BASE_JSON" | jq \
   .hooks = (.hooks // {})
   | .hooks.SessionStart     = ( strip(.hooks.SessionStart)
         + [ {hooks: [ cmd("agent-pack-update"; "agent-pack-update.sh"; 15),
-                      cmd("agent-pack-policies"; "agent-pack-policies.sh"; 10) ]} ] )
+                      cmd("agent-pack-policies"; "agent-pack-policies.sh"; 10),
+                      cmd("agent-slack-context"; "agent-slack-context.sh"; 10) ]} ] )
   | .hooks.UserPromptSubmit = ( strip(.hooks.UserPromptSubmit)
         + [ {matcher:"", hooks: [ cmd("agent-plan-clarify"; "agent-plan-clarify.sh"; 10) ]} ] )
   | .hooks.PreToolUse       = ( strip(.hooks.PreToolUse)
-        + [ {matcher:"Bash", hooks: [ cmd("agent-slack-guard"; "agent-slack-guard.sh"; 10) ]} ] )
-  | .hooks.PostToolUse      = ( strip(.hooks.PostToolUse)
-        + [ {matcher:"Read", hooks: [ cmd("agent-file-access"; "agent-file-access.sh"; 10) ]} ] )
+        + [ {matcher:"Bash", hooks: [ cmd("agent-slack-guard"; "agent-slack-guard.sh"; 10) ]},
+            {matcher:"Read", hooks: [ cmd("agent-company-file-access"; "agent-company-file-access.sh"; 12) ]} ] )
+  | .hooks.PostToolUse      = ( strip(.hooks.PostToolUse) )
   | .hooks.PreCompact       = ( strip(.hooks.PreCompact)
         + [ {hooks: [ cmd("agent-learn-handoff"; "agent-learn-handoff.sh"; 10) ]} ] )
   | .hooks.SessionEnd       = ( strip(.hooks.SessionEnd)

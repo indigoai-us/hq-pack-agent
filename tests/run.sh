@@ -186,6 +186,63 @@ assert_contains "install: user's pre-existing key survives" "$(cat "$R4/.claude/
 HQ_PACK_AGENT_HQ_ROOT="$R4" bash "$PKG/install/uninstall.sh" >/dev/null 2>&1
 assert_eq "uninstall: restores pre-existing settings byte-identical" "$(cat "$R4/.claude/settings.local.json")" "$ORIG"
 
+echo "== slack-context: SessionStart surfaces sender + channel roster =="
+SBIN="$TMP/bin-slack"; mkdir -p "$SBIN"
+cat > "$SBIN/hq" <<'HQ'
+#!/bin/bash
+if [ "$1" = "files" ] && [ "$2" = "acl" ]; then
+cat <<'A'
+ACL for knowledge/x.md (restricted)
+Direct entries (granted on this prefix):
+TYPE    GRANTEE         PERMISSION  GRANTED_BY  GRANTED_AT
+email   jacob@corp.com  read        prs_X       2026-07-10
+person  prs_BBB         write       prs_X       2026-07-10
+
+Inherited (granted on an ancestor prefix):
+TYPE    GRANTEE         PERMISSION  GRANTED_BY  SOURCE  GRANTED_AT
+email   corey@corp.com  read        prs_X       *       2026-05-20
+
+Granted on descendant prefixes (do not affect this prefix's access):
+TYPE    GRANTEE               PERMISSION  GRANTED_BY  SOURCE    GRANTED_AT
+email   shouldnotcount@x.com  read        prs_X       d/*       2026-05-13
+A
+exit 0
+fi
+if [ "$1" = "members" ] && [ "$2" = "list" ]; then printf 'jacob@corp.com owner J\n'; exit 0; fi
+exit 1
+HQ
+chmod +x "$SBIN/hq"
+
+RS="$(new_root slack)"; mkdir -p "$RS/workspace/.hq-pack-agent" "$RS/companies/acme/knowledge"
+cat > "$RS/workspace/.hq-pack-agent/slack-context.json" <<'J'
+{"channel":{"name":"deals"},"sender":{"email":"jacob@corp.com"},
+ "members":[{"email":"jacob@corp.com"},{"email":"corey@corp.com"},{"email":"guest@ext.com"}]}
+J
+SCTX="$(printf '' | HQ_PACK_AGENT_FORCE_AGENT=1 HQ_PACK_AGENT_HQ_ROOT="$RS" CLAUDE_PROJECT_DIR="$RS" bash "$PKG/hooks/agent-slack-context.sh" 2>/dev/null)"
+assert_contains "slack-context: names the sender email" "$SCTX" "jacob@corp.com"
+assert_contains "slack-context: lists a channel member" "$SCTX" "guest@ext.com"
+assert_contains "slack-context: labels the channel" "$SCTX" "#deals"
+# not a slack session -> silent
+NOCTX="$(printf '' | HQ_PACK_AGENT_FORCE_AGENT=1 HQ_PACK_AGENT_HQ_ROOT="$(new_root noslack)" bash "$PKG/hooks/agent-slack-context.sh" 2>/dev/null)"
+assert_eq "slack-context: silent without any Slack context" "$NOCTX" ""
+
+echo "== company-file-access: PreToolUse Read channel cross-reference =="
+fa() { printf '%s' "{\"tool_input\":{\"file_path\":\"$2\"}}" | env "PATH=$SBIN:$PATH" "$1" "HQ_PACK_AGENT_HQ_ROOT=$RS" "CLAUDE_PROJECT_DIR=$RS" bash "$PKG/hooks/agent-company-file-access.sh" 2>/dev/null; }
+FO="$(fa HQ_PACK_AGENT_FORCE_AGENT=1 "$RS/companies/acme/knowledge/x.md")"
+assert_contains "file-access: WITH-access lists jacob (direct email)"    "$FO" "jacob@corp.com"
+assert_contains "file-access: WITH-access lists corey (inherited email)" "$FO" "corey@corp.com"
+assert_contains "file-access: WITHOUT-access flags guest"                "$FO" "guest@ext.com"
+assert_contains "file-access: do-not-share warning present"              "$FO" "DO NOT share"
+assert_contains "file-access: non-exhaustive + exact command"            "$FO" "hq files acl 'knowledge/x.md' --company acme"
+assert_not_contains "file-access: descendant-prefix grant excluded"      "$FO" "shouldnotcount"
+assert_eq "file-access: non-company path is silent" "$(fa HQ_PACK_AGENT_FORCE_AGENT=1 "$RS/core/x.md")" ""
+assert_eq "file-access: human session is silent"    "$(fa HQ_PACK_AGENT_FORCE_HUMAN=1 "$RS/companies/acme/knowledge/x.md")" ""
+rm -f "$RS/workspace/.hq-pack-agent/slack-context.json"; rm -rf "$RS/workspace/.hq-pack-agent/acl-cache"
+NR="$(fa HQ_PACK_AGENT_FORCE_AGENT=1 "$RS/companies/acme/knowledge/x.md")"
+assert_contains "file-access(no roster): general who-can-access summary" "$NR" "Who can access this company file"
+assert_not_contains "file-access(no roster): no channel-member phrasing" "$NR" "Channel members WITHOUT"
+
+
 echo
 echo "== $PASS passed, $FAIL failed =="
 [ "$FAIL" -eq 0 ]
