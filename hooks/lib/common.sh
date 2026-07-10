@@ -9,8 +9,17 @@
 hqpa_hq_root() {
   if [ -n "${HQ_PACK_AGENT_HQ_ROOT:-}" ]; then printf '%s' "$HQ_PACK_AGENT_HQ_ROOT"; return 0; fi
   if [ -n "${CLAUDE_PROJECT_DIR:-}" ]; then printf '%s' "$CLAUDE_PROJECT_DIR"; return 0; fi
-  # Fall back to three levels up from this lib (…/<install-dir>/hooks/lib/common.sh).
-  ( cd "$(dirname "${BASH_SOURCE[0]:-$0}")/../.." 2>/dev/null && pwd ) || printf ''
+  # Fall back: walk UP from this lib to the real HQ root (the nearest ancestor
+  # that contains a .claude/ dir). The installed layout nests this lib under
+  # <hq-root>/workspace/.hq-pack-agent/pkg/hooks/lib/, so a fixed "../.." lands in
+  # the package dir, not the HQ root — walk until .claude is found instead.
+  local d
+  d="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+  while [ -n "$d" ] && [ "$d" != "/" ]; do
+    [ -d "$d/.claude" ] && { printf '%s' "$d"; return 0; }
+    d="$(dirname "$d")"
+  done
+  printf ''
 }
 
 # --- Package state dir (under workspace/, mirrors check-hq-update's cache home) ---

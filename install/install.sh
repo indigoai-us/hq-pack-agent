@@ -88,7 +88,10 @@ NEW_JSON="$(printf '%s' "$BASE_JSON" | jq \
   def strip(arr): (arr // []) | [ .[]
       | .hooks |= (map(select(((.command // "") | contains($M)) | not)))
       | select(((.hooks) // [] | length) > 0) ];
-  def cmd(id; file; t): {type:"command", command: ($gate + " " + id + " " + $dir + "/" + file), timeout: t};
+  # Shell-quote the gate + script paths so an HQ root containing spaces or shell
+  # metacharacters does not split the command into the wrong argv (the command
+  # string is run via sh -c by Claude Code). The hook id is a fixed safe token.
+  def cmd(id; file; t): {type:"command", command: ("\"" + $gate + "\" " + id + " \"" + $dir + "/" + file + "\""), timeout: t};
   .hooks = (.hooks // {})
   | .hooks.SessionStart     = ( strip(.hooks.SessionStart)
         + [ {hooks: [ cmd("agent-pack-update"; "agent-pack-update.sh"; 15),
