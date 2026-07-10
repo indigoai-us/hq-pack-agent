@@ -88,17 +88,21 @@ NEW_JSON="$(printf '%s' "$BASE_JSON" | jq \
   def strip(arr): (arr // []) | [ .[]
       | .hooks |= (map(select(((.command // "") | contains($M)) | not)))
       | select(((.hooks) // [] | length) > 0) ];
-  def cmd(id; file; t): {type:"command", command: ($gate + " " + id + " " + $dir + "/" + file), timeout: t};
+  # Shell-quote the gate + script paths so an HQ root containing spaces or shell
+  # metacharacters does not split the command into the wrong argv (the command
+  # string is run via sh -c by Claude Code). The hook id is a fixed safe token.
+  def cmd(id; file; t): {type:"command", command: ("\"" + $gate + "\" " + id + " \"" + $dir + "/" + file + "\""), timeout: t};
   .hooks = (.hooks // {})
   | .hooks.SessionStart     = ( strip(.hooks.SessionStart)
         + [ {hooks: [ cmd("agent-pack-update"; "agent-pack-update.sh"; 15),
-                      cmd("agent-pack-policies"; "agent-pack-policies.sh"; 10) ]} ] )
+                      cmd("agent-pack-policies"; "agent-pack-policies.sh"; 10),
+                      cmd("agent-slack-context"; "agent-slack-context.sh"; 10) ]} ] )
   | .hooks.UserPromptSubmit = ( strip(.hooks.UserPromptSubmit)
         + [ {matcher:"", hooks: [ cmd("agent-plan-clarify"; "agent-plan-clarify.sh"; 10) ]} ] )
   | .hooks.PreToolUse       = ( strip(.hooks.PreToolUse)
-        + [ {matcher:"Bash", hooks: [ cmd("agent-slack-guard"; "agent-slack-guard.sh"; 10) ]} ] )
-  | .hooks.PostToolUse      = ( strip(.hooks.PostToolUse)
-        + [ {matcher:"Read", hooks: [ cmd("agent-file-access"; "agent-file-access.sh"; 10) ]} ] )
+        + [ {matcher:"Bash", hooks: [ cmd("agent-slack-guard"; "agent-slack-guard.sh"; 10) ]},
+            {matcher:"Read", hooks: [ cmd("agent-company-file-access"; "agent-company-file-access.sh"; 12) ]} ] )
+  | .hooks.PostToolUse      = ( strip(.hooks.PostToolUse) )
   | .hooks.PreCompact       = ( strip(.hooks.PreCompact)
         + [ {hooks: [ cmd("agent-learn-handoff"; "agent-learn-handoff.sh"; 10) ]} ] )
   | .hooks.SessionEnd       = ( strip(.hooks.SessionEnd)

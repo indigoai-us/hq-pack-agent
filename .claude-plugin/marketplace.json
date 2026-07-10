@@ -9,7 +9,7 @@
       "name": "hq-agent",
       "source": "./",
       "description": "Agent-only hooks, policies, and skills for HQ agents (Slack / email / cloud workers). Inert in human sessions; self-updating from its own private release.",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "author": {
         "name": "Indigo / HQ",
         "url": "https://github.com/indigoai-us"

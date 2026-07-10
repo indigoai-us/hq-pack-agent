@@ -20,7 +20,8 @@ Each behavior is an agent-gated hook plus a policy that documents the rule:
 | Per-channel voice profile (Slack/Telegram/email/SMS) | injected by `agent-pack-policies.sh` (SessionStart) | `agent-voice-per-channel` |
 | Plan-mode / clarify gate — batch questions before acting | `agent-plan-clarify.sh` (UserPromptSubmit) | `agent-plan-clarify` |
 | Forced learning + handoff | `agent-learn-handoff.sh` (PreCompact / SessionEnd) | `agent-forced-learning-handoff` |
-| File-access awareness — who can see what you just read | `agent-file-access.sh` (PostToolUse:Read) | `agent-file-access-awareness` |
+| Company-file access awareness — who in the Slack channel can/can't see a file | `agent-company-file-access.sh` (PreToolUse:Read) | `agent-file-access-awareness` |
+| Slack session context — who sent the message + who's in the channel | `agent-slack-context.sh` (SessionStart) | `agent-slack-channel-context` |
 
 Behaviors are data-driven: a new behavior is a new hook + policy file plus a line
 in `install/install.sh`, not an edit to a monolith.
@@ -71,6 +72,41 @@ package deliberately omits a `contributes:` block and wires **itself** into the
 local overlay through `install.sh` instead. It also ships its **own** gate rather
 than editing core `hook-gate.sh`, whose hardcoded profile allowlist would
 silently skip unknown hook IDs (and whose edits `/update-hq` would clobber).
+
+## Slack session context (integration contract)
+
+The Slack-aware behaviors read a **channel roster hq-pro passes in at spawn** —
+the hook never calls Slack itself. hq-pro resolves the triggering message's
+sender and the channel members (with emails) once, at spawn, and hands them to
+the agent session in either form (checked in order by `hooks/lib/slack-context.sh`):
+
+1. A JSON file at `$HQ_SLACK_CONTEXT_FILE`, or the default
+   `workspace/.hq-pack-agent/slack-context.json`:
+
+   ```json
+   {
+     "channel": { "id": "C123", "name": "acme-deals" },
+     "sender":  { "email": "jacob@corp.com", "slack_id": "U1", "handle": "jacob" },
+     "members": [ { "email": "a@corp.com" }, { "email": "b@corp.com" } ]
+   }
+   ```
+
+2. Env fallback: `HQ_SLACK_CHANNEL_ID`, `HQ_SLACK_CHANNEL_NAME`,
+   `HQ_SLACK_SENDER_EMAIL`, `HQ_SLACK_SENDER_HANDLE`,
+   `HQ_SLACK_MEMBER_EMAILS` (comma/space separated).
+
+Given this, on each agent session:
+
+- **`agent-slack-context.sh`** (SessionStart) tells the agent exactly which email
+  sent the message and who else is in the channel.
+- **`agent-company-file-access.sh`** (PreToolUse:Read) — when the agent reads a
+  `companies/<slug>/…` file — fetches the file's ACL live (`hq files acl <rel>
+  --company <slug>`, resolving company-wide grants via `hq members list`),
+  intersects it with the channel roster, and injects: which channel members
+  **have** access, which **do not**, a **do-not-share** warning when anyone
+  lacks access, and the exact command for the full (non-exhaustive) ACL. ACL and
+  membership are cached per session and time-boxed; absent context ⇒ a plain
+  who-has-access summary.
 
 ## Update (self-update, the crux)
 
@@ -144,9 +180,10 @@ hq-pack-agent/
     agent-pack-policies.sh  # injects the agent policy pack (SessionStart)
     agent-slack-guard.sh    # markdown-strip / short-reply guidance
     agent-plan-clarify.sh   # plan-mode / clarify gate
-    agent-file-access.sh    # file-access awareness
+    agent-company-file-access.sh # company-file access awareness (channel cross-ref)
+    agent-slack-context.sh  # Slack session context (sender + channel roster)
     agent-learn-handoff.sh  # forced learning + handoff
-    lib/{common.sh,markdown-strip.sh,is-agent.sh}
+    lib/{common.sh,markdown-strip.sh,slack-context.sh,is-agent.sh}
   policies/             # agent-only policy .md files (injected, not core-loaded)
   skills/               # agent-facing skills (deferred in v1 — see skills/README.md)
   scripts/build-plugin.sh
