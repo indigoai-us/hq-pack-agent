@@ -75,7 +75,16 @@ if [ -z "$HOOK_SCRIPT" ] || [ ! -f "$HOOK_SCRIPT" ]; then
   exit 0
 fi
 
-# Pass through the delegated hook's exit code (so a PreToolUse hook CAN block with
-# exit 2). If the delegated hook itself errors out, the EXIT trap forces 0.
+# Pass through a DELIBERATE PreToolUse block (exit 2) so a hook can veto a tool
+# call (e.g. agent-slack-guard blocking a wall-of-text send). ANY OTHER non-zero
+# is an accidental hook error and fails OPEN to a skip (exit 0) so a buggy hook can
+# never wedge the session. NB: `exit $?` alone would be eaten by the EXIT trap
+# above (an EXIT trap that calls `exit` overrides the pending status), so the block
+# path clears the trap first.
 bash "$HOOK_SCRIPT" "$@"
-exit $?
+rc=$?
+if [ "$rc" -eq 2 ]; then
+  trap - EXIT
+  exit 2
+fi
+exit 0

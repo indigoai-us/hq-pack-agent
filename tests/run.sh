@@ -352,6 +352,46 @@ ss_has() { jq -e --arg e "$1" --arg m "$2" --arg id "$3" '.hooks[$e][] | select(
 ss_has SessionStart "" agent-slack-context && ok "wiring: SessionStart runs agent-slack-context" || bad "wiring: SessionStart agent-slack-context missing"
 ss_has PreToolUse Read agent-company-file-access && ok "wiring: PreToolUse/Read runs agent-company-file-access" || bad "wiring: PreToolUse/Read agent-company-file-access missing"
 if grep -q 'agent-file-access\.sh' "$SL"; then bad "wiring: retired agent-file-access.sh must be absent"; else ok "wiring: retired PostToolUse agent-file-access absent"; fi
+echo "== agent-slack-guard: block long sends / advise short =="
+guard() {  # $1=payload json; rest=env KEY=VAL. Sets G_OUT G_ERR G_RC.
+  local p="$1"; shift
+  G_OUT="$(printf '%s' "$p" | env "$@" bash "$PKG/hooks/agent-slack-guard.sh" 2>"$TMP/guard.err")"; G_RC=$?
+  G_ERR="$(cat "$TMP/guard.err" 2>/dev/null)"
+}
+LONGCMD="slack-call chat.postMessage $(printf 'x%.0s' $(seq 1 2500))"
+# Long outbound send in an agent session -> HARD BLOCK (exit 2 + /deploy redirect).
+guard "{\"tool_input\":{\"command\":\"$LONGCMD\"}}" HQ_PACK_AGENT_FORCE_AGENT=1
+assert_eq "guard: long send exits 2 (blocked)" "$G_RC" "2"
+assert_contains "guard: block says BLOCKED" "$G_ERR" "BLOCKED"
+assert_contains "guard: block redirects to /deploy" "$G_ERR" "/deploy"
+assert_eq "guard: block writes nothing to stdout" "$G_OUT" ""
+# Short outbound send -> advisory only (exit 0, stdout reminder, no block).
+guard '{"tool_input":{"command":"slack-call chat.postMessage {\"text\":\"Done, it is live: https://x.io/a\"}"}}' HQ_PACK_AGENT_FORCE_AGENT=1
+assert_eq "guard: short send exits 0" "$G_RC" "0"
+assert_contains "guard: short send advises" "$G_OUT" "Outbound message detected"
+assert_not_contains "guard: short send not blocked" "$G_ERR" "BLOCKED"
+# A raised custom limit lets a long send through (advisory, not blocked).
+guard "{\"tool_input\":{\"command\":\"$LONGCMD\"}}" HQ_PACK_AGENT_FORCE_AGENT=1 HQ_SLACK_MAX_REPLY_CHARS=9000
+assert_eq "guard: raised limit allows the long send" "$G_RC" "0"
+assert_not_contains "guard: raised limit not blocked" "$G_ERR" "BLOCKED"
+# Non-message command -> inert (silent, exit 0).
+guard '{"tool_input":{"command":"ls -la /tmp"}}' HQ_PACK_AGENT_FORCE_AGENT=1
+assert_eq "guard: non-message exits 0" "$G_RC" "0"
+assert_eq "guard: non-message is silent" "$G_OUT" ""
+# Human session -> never blocks, even a long send (fail-open).
+guard "{\"tool_input\":{\"command\":\"$LONGCMD\"}}" HQ_PACK_AGENT_FORCE_HUMAN=1
+assert_eq "guard: human session never blocks" "$G_RC" "0"
+
+echo "== gate propagates a deliberate exit-2 block (but nothing else) =="
+# Production path: hooks run THROUGH agent-pack-gate.sh. A block must survive it.
+printf '%s' "{\"tool_input\":{\"command\":\"$LONGCMD\"}}" | env HQ_PACK_AGENT_FORCE_AGENT=1 bash "$PKG/hooks/agent-pack-gate.sh" agent-slack-guard "$PKG/hooks/agent-slack-guard.sh" >"$TMP/gate.out" 2>"$TMP/gate.err"
+assert_eq "gate: long send blocked THROUGH the gate (exit 2)" "$?" "2"
+assert_contains "gate: block reason reaches stderr through the gate" "$(cat "$TMP/gate.err")" "/deploy"
+# A hook that errors non-deliberately (exit 1) still fails OPEN through the gate.
+ERRHOOK="$TMP/errhook.sh"; printf '#!/bin/bash\ncat >/dev/null 2>&1\nexit 1\n' > "$ERRHOOK"; chmod +x "$ERRHOOK"
+echo '{}' | env HQ_PACK_AGENT_FORCE_AGENT=1 bash "$PKG/hooks/agent-pack-gate.sh" errhook "$ERRHOOK" >/dev/null 2>&1
+assert_eq "gate: a non-2 hook error fails OPEN (exit 0)" "$?" "0"
+
 echo
 echo "== $PASS passed, $FAIL failed =="
 [ "$FAIL" -eq 0 ]
