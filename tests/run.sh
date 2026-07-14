@@ -93,6 +93,22 @@ assert_contains "gate: agent session runs delegate" "$out_a" "RAN_DELEGATE"
 out_d="$(echo '{}' | HQ_PACK_AGENT_FORCE_AGENT=1 HQ_PACK_AGENT_DISABLED_HOOKS=demo bash "$PKG/hooks/agent-pack-gate.sh" demo "$DELEG" 2>/dev/null)"
 assert_not_contains "gate: disabled hook is skipped" "$out_d" "RAN_DELEGATE"
 
+echo "== agent-startwork: fresh agent startups only =="
+startwork() { printf '%s' "$1" | env "${@:2}" bash "$PKG/hooks/agent-startwork.sh" 2>/dev/null; }
+START_HUMAN="$(startwork '{"source":"startup"}' HQ_PACK_AGENT_FORCE_HUMAN=1)"
+assert_eq "startwork: non-agent session is silent" "$START_HUMAN" ""
+START_RESUME="$(startwork '{"source":"resume"}' HQ_PACK_AGENT_FORCE_AGENT=1)"
+assert_eq "startwork: non-startup source is silent" "$START_RESUME" ""
+START_AGENT="$(startwork '{"source":"startup"}' HQ_PACK_AGENT_FORCE_AGENT=1 HQ_COMPANY=acme)"
+assert_contains "startwork: agent startup emits directive" "$START_AGENT" "<hq-pack-agent-startwork>"
+assert_contains "startwork: agent startup runs startwork first" "$START_AGENT" "/startwork acme as your FIRST action"
+
+echo "== agent-learn-handoff: invoke the core handoff skill =="
+HANDOFF="$(printf '{}' | env HQ_PACK_AGENT_FORCE_AGENT=1 bash "$PKG/hooks/agent-learn-handoff.sh" 2>/dev/null)"
+assert_contains "handoff: keeps checkpoint guidance" "$HANDOFF" "Save a checkpoint"
+assert_contains "handoff: directs the core handoff skill" "$HANDOFF" "Run /handoff now"
+assert_contains "handoff: keeps learn guidance" "$HANDOFF" "/learn"
+
 echo "== markdown-strip transform =="
 . "$PKG/hooks/lib/markdown-strip.sh"
 IN=$'# Heading\nThis is **bold** and `code` and _em_.\nSee [docs](https://x.io)\n```bash\nls\n```'
@@ -192,6 +208,7 @@ HQ_PACK_AGENT_HQ_ROOT="$R3" bash "$PKG/install/install.sh" >/dev/null 2>&1
 SECOND="$(cat "$R3/.claude/settings.local.json")"
 assert_eq "install is idempotent (identical settings twice)" "$SECOND" "$FIRST"
 assert_contains "install wired the gate into settings" "$FIRST" "agent-pack-gate.sh"
+assert_contains "install wired agent-startwork into settings" "$FIRST" "agent-startwork.sh"
 HQ_PACK_AGENT_HQ_ROOT="$R3" bash "$PKG/install/uninstall.sh" >/dev/null 2>&1
 assert_nofile "$R3/.claude/settings.local.json" "uninstall: removes settings.local.json (byte-identical absence)"
 assert_nofile "$R3/workspace/.hq-pack-agent" "uninstall: removes package state dir"
@@ -350,6 +367,7 @@ HQ_PACK_AGENT_HQ_ROOT="$RW" bash "$PKG/install/install.sh" >/dev/null 2>&1
 SL="$RW/.claude/settings.local.json"
 ss_has() { jq -e --arg e "$1" --arg m "$2" --arg id "$3" '.hooks[$e][] | select(($m=="" ) or (.matcher==$m)) | .hooks[] | select((.command|contains("gate.sh\" "+$id+" ")) and (.command|endswith($id+".sh\"")))' "$SL" >/dev/null 2>&1; }
 ss_has SessionStart "" agent-slack-context && ok "wiring: SessionStart runs agent-slack-context" || bad "wiring: SessionStart agent-slack-context missing"
+ss_has SessionStart "" agent-startwork && ok "wiring: SessionStart runs agent-startwork" || bad "wiring: SessionStart agent-startwork missing"
 ss_has PreToolUse Read agent-company-file-access && ok "wiring: PreToolUse/Read runs agent-company-file-access" || bad "wiring: PreToolUse/Read agent-company-file-access missing"
 if grep -q 'agent-file-access\.sh' "$SL"; then bad "wiring: retired agent-file-access.sh must be absent"; else ok "wiring: retired PostToolUse agent-file-access absent"; fi
 echo "== agent-slack-guard: block long sends / advise short =="
