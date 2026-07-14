@@ -2,8 +2,8 @@
 # agent-learn-handoff.sh — PreCompact / SessionEnd. Forced learning + handoff.
 #
 # Agents run unattended, so they must persist state on their own cadence. On a
-# compaction boundary (or session end) remind the agent to checkpoint, write a
-# handoff, and route any reusable rules through /learn before context is lost.
+# compaction boundary (or session end) require the agent to checkpoint, run
+# /handoff, and route any reusable rules through /learn before context is lost.
 # Advisory context only.
 
 trap 'exit 0' EXIT
@@ -21,7 +21,8 @@ cat <<'EOF'
 <hq-pack-agent-learn-handoff>
 Context is about to compact / the session is ending. Before you lose state:
 - Save a checkpoint of what you're mid-way through.
-- Write a handoff so the next agent session can resume cleanly.
+- Run /handoff now. Do not merely write handoff notes: invoke /handoff so the
+  next agent session can resume cleanly.
 - Route any reusable rule you discovered through /learn (not inline notes).
 Do this now — you are autonomous; nobody else will.
 </hq-pack-agent-learn-handoff>
