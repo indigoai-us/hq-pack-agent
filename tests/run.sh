@@ -43,10 +43,14 @@ make_stubs() {
   local bin="$1"; mkdir -p "$bin"
   cat > "$bin/gh" <<'EOF'
 #!/bin/bash
+record_call() {
+  [ -n "${FAKE_CALL_RECORD:-}" ] && printf 'gh %s\n' "$*" >> "$FAKE_CALL_RECORD"
+  [ -n "${FAKE_NETWORK_SLEEP:-}" ] && sleep "$FAKE_NETWORK_SLEEP"
+}
 case "$*" in
-  "auth status") [ "${FAKE_GH_AUTH:-0}" = "1" ] && exit 0 || exit 1 ;;
+  "auth status") record_call "$@"; [ "${FAKE_GH_AUTH:-0}" = "1" ] && exit 0 || exit 1 ;;
   "auth token")  [ "${FAKE_GH_AUTH:-0}" = "1" ] && { echo "ghp_FAKEfaketoken000000000000000000000000"; exit 0; } || exit 1 ;;
-  *"release view"*) [ -n "${FAKE_GH_TAG:-}" ] && { echo "$FAKE_GH_TAG"; exit 0; } || exit 1 ;;
+  *"release view"*) record_call "$@"; [ -n "${FAKE_GH_TAG:-}" ] && { echo "$FAKE_GH_TAG"; exit 0; } || exit 1 ;;
   *) exit 1 ;;
 esac
 EOF
@@ -59,6 +63,8 @@ case "$1" in
     exit 0
     ;;
   --version)
+    [ -n "${FAKE_CALL_RECORD:-}" ] && printf 'hq --version\n' >> "$FAKE_CALL_RECORD"
+    [ -n "${FAKE_NETWORK_SLEEP:-}" ] && sleep "$FAKE_NETWORK_SLEEP"
     [ -n "${FAKE_HQ_CLI_VERSION:-}" ] && { printf 'hq %s\n' "$FAKE_HQ_CLI_VERSION"; exit 0; }
     exit 1
     ;;
@@ -73,6 +79,8 @@ EOF
 #!/bin/bash
 case "$1" in
   view)
+    [ -n "${FAKE_CALL_RECORD:-}" ] && printf 'npm %s\n' "$*" >> "$FAKE_CALL_RECORD"
+    [ -n "${FAKE_NETWORK_SLEEP:-}" ] && sleep "$FAKE_NETWORK_SLEEP"
     [ -n "${FAKE_NPM_VERSION:-}" ] && { printf '%s\n' "$FAKE_NPM_VERSION"; exit 0; }
     exit 1
     ;;
@@ -89,11 +97,39 @@ EOF
   cat > "$bin/curl" <<'EOF'
 #!/bin/bash
 case "$*" in
-  *"releases/latest"*) [ -n "${FAKE_GH_TAG:-}" ] && { printf '{"tag_name":"%s"}\n' "$FAKE_GH_TAG"; exit 0; } || exit 1 ;;
+  *"releases/latest"*)
+    [ -n "${FAKE_CALL_RECORD:-}" ] && printf 'curl %s\n' "$*" >> "$FAKE_CALL_RECORD"
+    [ -n "${FAKE_NETWORK_SLEEP:-}" ] && sleep "$FAKE_NETWORK_SLEEP"
+    [ -n "${FAKE_GH_TAG:-}" ] && { printf '{"tag_name":"%s"}\n' "$FAKE_GH_TAG"; exit 0; } || exit 1
+    ;;
   *) exit 1 ;;
 esac
 EOF
-  chmod +x "$bin/gh" "$bin/hq" "$bin/npm" "$bin/curl"
+  # These shims let the self-update tests either execute a detached body inline
+  # (and mark completion) or record the fork without running its command.
+  cat > "$bin/setsid" <<'EOF'
+#!/bin/bash
+[ -n "${FAKE_FORK_RECORD:-}" ] && printf 'setsid %s\n' "$*" >> "$FAKE_FORK_RECORD"
+[ "${FAKE_FORK_MODE:-passthrough}" = "record-only" ] && exit 0
+"$@"
+status=$?
+case "$*" in
+  *"--hq-selfupdate-background"*) [ -n "${FAKE_OUTER_FORK_DONE:-}" ] && printf 'done\n' > "$FAKE_OUTER_FORK_DONE" ;;
+esac
+exit "$status"
+EOF
+  cat > "$bin/nohup" <<'EOF'
+#!/bin/bash
+[ -n "${FAKE_FORK_RECORD:-}" ] && printf 'nohup %s\n' "$*" >> "$FAKE_FORK_RECORD"
+[ "${FAKE_FORK_MODE:-passthrough}" = "record-only" ] && exit 0
+"$@"
+status=$?
+case "$*" in
+  *"--hq-selfupdate-background"*) [ -n "${FAKE_OUTER_FORK_DONE:-}" ] && printf 'done\n' > "$FAKE_OUTER_FORK_DONE" ;;
+esac
+exit "$status"
+EOF
+  chmod +x "$bin/gh" "$bin/hq" "$bin/npm" "$bin/curl" "$bin/setsid" "$bin/nohup"
 }
 
 # Detached children should record virtually immediately, but tolerate scheduler
@@ -213,49 +249,73 @@ echo "== agent-hq-selfupdate: detached autonomous maintenance =="
 R5="$(new_root hq-selfupdate)"; BIN5="$TMP/bin-hq-selfupdate"; make_stubs "$BIN5"
 SELF_STATE="$R5/workspace/.hq-pack-agent"
 SELF_RECORDS="$R5/records"
+SELF_PROBES="$R5/probes"; mkdir -p "$SELF_PROBES"
+SELF_FORKS="$SELF_PROBES/forks.log"
+SELF_CALLS="$SELF_PROBES/network-calls.log"
+SELF_DONE="$SELF_PROBES/background-done"
 run_selfupdate() { # env-configured; stdin closes immediately like a real SessionStart hook.
   ( export PATH="$BIN5:$PATH" HQ_PACK_AGENT_HQ_ROOT="$R5" HQ_PACK_AGENT_FORCE_AGENT=1
     "$@" bash "$PKG/hooks/agent-hq-selfupdate.sh" </dev/null 2>/dev/null )
 }
-# (a) Human sessions never initialize state, schedule work, or print anything.
-out="$(env PATH="$BIN5:$PATH" HQ_PACK_AGENT_HQ_ROOT="$R5" HQ_PACK_AGENT_FORCE_HUMAN=1 FAKE_HQ_CLI_VERSION=1.0.0 FAKE_NPM_VERSION=2.0.0 FAKE_RECORD_DIR="$SELF_RECORDS" bash "$PKG/hooks/agent-hq-selfupdate.sh" </dev/null 2>/dev/null)"
+# (a) Human sessions never initialize state, fork, make a network call, or print.
+rm -rf "$SELF_STATE" "$SELF_RECORDS"; rm -f "$SELF_FORKS" "$SELF_CALLS" "$SELF_DONE"
+out="$(env PATH="$BIN5:$PATH" HQ_PACK_AGENT_HQ_ROOT="$R5" HQ_PACK_AGENT_FORCE_HUMAN=1 FAKE_HQ_CLI_VERSION=1.0.0 FAKE_NPM_VERSION=2.0.0 FAKE_RECORD_DIR="$SELF_RECORDS" FAKE_FORK_RECORD="$SELF_FORKS" FAKE_CALL_RECORD="$SELF_CALLS" FAKE_FORK_MODE=record-only bash "$PKG/hooks/agent-hq-selfupdate.sh" </dev/null 2>/dev/null)"
 assert_eq "hq-selfupdate: non-agent session is silent" "$out" ""
 assert_nofile "$SELF_STATE" "hq-selfupdate: non-agent session schedules no work"
-# (b) A fresh 24-hour cache stops all update checks before they begin.
+assert_nofile "$SELF_FORKS" "hq-selfupdate: non-agent session forks nothing"
+assert_nofile "$SELF_CALLS" "hq-selfupdate: non-agent session makes no network call"
+# (b) A fresh 24-hour cache stops all update checks before they begin or fork.
 mkdir -p "$SELF_STATE"; printf '{"latest":"9.9.9"}\n' > "$SELF_STATE/hq-selfupdate-last-check.json"
-rm -rf "$SELF_RECORDS"
-out="$(FAKE_HQ_CLI_VERSION=1.0.0 FAKE_NPM_VERSION=2.0.0 FAKE_RECORD_DIR="$SELF_RECORDS" run_selfupdate env)"
+rm -rf "$SELF_RECORDS"; rm -f "$SELF_FORKS" "$SELF_CALLS" "$SELF_DONE"
+out="$(FAKE_HQ_CLI_VERSION=1.0.0 FAKE_NPM_VERSION=2.0.0 FAKE_RECORD_DIR="$SELF_RECORDS" FAKE_FORK_RECORD="$SELF_FORKS" FAKE_CALL_RECORD="$SELF_CALLS" FAKE_FORK_MODE=record-only run_selfupdate env)"
 assert_eq "hq-selfupdate: fresh cache throttles silently" "$out" ""
 assert_nofile "$SELF_RECORDS/npm-install.log" "hq-selfupdate: fresh cache schedules no cli install"
 assert_nofile "$SELF_RECORDS/rescue.log" "hq-selfupdate: fresh cache schedules no rescue"
-# (c) An old CLI schedules a detached npm install and provides an advisory.
+assert_nofile "$SELF_FORKS" "hq-selfupdate: fresh cache forks nothing"
+assert_nofile "$SELF_CALLS" "hq-selfupdate: fresh cache makes no network call"
+# (c) An old CLI runs in the detached body and schedules an npm install.
 rm -f "$SELF_STATE/hq-selfupdate-last-check.json" "$SELF_STATE/hq-cli-auto-update.stamp" "$SELF_STATE/hq-core-rescue.stamp"
-rm -rf "$SELF_RECORDS"
-out="$(FAKE_HQ_CLI_VERSION=1.0.0 FAKE_NPM_VERSION=2.0.0 FAKE_RECORD_DIR="$SELF_RECORDS" run_selfupdate env)"
-assert_contains "hq-selfupdate: old cli emits advisory" "$out" "hq-cli-auto-update"
+rm -rf "$SELF_RECORDS"; rm -f "$SELF_FORKS" "$SELF_CALLS" "$SELF_DONE"
+out="$(FAKE_HQ_CLI_VERSION=1.0.0 FAKE_NPM_VERSION=2.0.0 FAKE_RECORD_DIR="$SELF_RECORDS" FAKE_FORK_RECORD="$SELF_FORKS" FAKE_CALL_RECORD="$SELF_CALLS" FAKE_OUTER_FORK_DONE="$SELF_DONE" run_selfupdate env)"
+assert_eq "hq-selfupdate: old cli remains silent" "$out" ""
+wait_for_record "$SELF_DONE" && ok "hq-selfupdate: old cli runs the detached body" || bad "hq-selfupdate: old cli runs the detached body"
 wait_for_record "$SELF_RECORDS/npm-install.log" && ok "hq-selfupdate: old cli schedules detached npm install" || bad "hq-selfupdate: old cli schedules detached npm install"
 assert_contains "hq-selfupdate: npm install targets latest cli" "$(cat "$SELF_RECORDS/npm-install.log" 2>/dev/null)" "install -g @indigoai-us/hq-cli@latest"
+assert_contains "hq-selfupdate: cli scheduling outcome is logged" "$(cat "$SELF_STATE/debug.log" 2>/dev/null)" "hq-cli update scheduled 1.0.0->2.0.0"
 # (d) An equal/current CLI never schedules another install.
 rm -f "$SELF_STATE/hq-selfupdate-last-check.json" "$SELF_STATE/hq-cli-auto-update.stamp"
-rm -rf "$SELF_RECORDS"
-out="$(FAKE_HQ_CLI_VERSION=2.0.0 FAKE_NPM_VERSION=2.0.0 FAKE_RECORD_DIR="$SELF_RECORDS" run_selfupdate env)"
-assert_not_contains "hq-selfupdate: current cli has no advisory" "$out" "hq-cli-auto-update"
+rm -rf "$SELF_RECORDS"; rm -f "$SELF_DONE"
+out="$(FAKE_HQ_CLI_VERSION=2.0.0 FAKE_NPM_VERSION=2.0.0 FAKE_RECORD_DIR="$SELF_RECORDS" FAKE_OUTER_FORK_DONE="$SELF_DONE" run_selfupdate env)"
+assert_eq "hq-selfupdate: current cli remains silent" "$out" ""
+wait_for_record "$SELF_DONE" && ok "hq-selfupdate: current cli runs the detached body" || bad "hq-selfupdate: current cli runs the detached body"
 assert_nofile "$SELF_RECORDS/npm-install.log" "hq-selfupdate: current cli schedules no install"
 # (e) A newer public core release uses the curl fallback and schedules hq rescue.
 mkdir -p "$R5/core"; printf 'hqVersion: 1.0.0\n' > "$R5/core/core.yaml"
 rm -f "$SELF_STATE/hq-selfupdate-last-check.json" "$SELF_STATE/hq-core-rescue.stamp"
-rm -rf "$SELF_RECORDS"
-out="$(FAKE_GH_AUTH=0 FAKE_GH_TAG=v2.0.0 FAKE_RECORD_DIR="$SELF_RECORDS" run_selfupdate env)"
-assert_contains "hq-selfupdate: newer core emits advisory" "$out" "hq-core-auto-update"
+rm -rf "$SELF_RECORDS"; rm -f "$SELF_DONE"
+out="$(FAKE_GH_AUTH=0 FAKE_GH_TAG=v2.0.0 FAKE_RECORD_DIR="$SELF_RECORDS" FAKE_OUTER_FORK_DONE="$SELF_DONE" run_selfupdate env)"
+assert_eq "hq-selfupdate: newer core remains silent" "$out" ""
 wait_for_record "$SELF_RECORDS/rescue.log" && ok "hq-selfupdate: newer core schedules detached rescue" || bad "hq-selfupdate: newer core schedules detached rescue"
 assert_contains "hq-selfupdate: rescue receives HQ root" "$(cat "$SELF_RECORDS/rescue.log" 2>/dev/null)" "rescue --hq-root $R5 --yes"
+assert_contains "hq-selfupdate: rescue scheduling outcome is logged" "$(cat "$SELF_STATE/debug.log" 2>/dev/null)" "hq rescue scheduled 1.0.0->2.0.0"
 # (f) Equal hq-core versions never schedule rescue.
 printf 'hqVersion: 2.0.0\n' > "$R5/core/core.yaml"
 rm -f "$SELF_STATE/hq-selfupdate-last-check.json" "$SELF_STATE/hq-core-rescue.stamp"
-rm -rf "$SELF_RECORDS"
-out="$(FAKE_GH_AUTH=0 FAKE_GH_TAG=v2.0.0 FAKE_RECORD_DIR="$SELF_RECORDS" run_selfupdate env)"
-assert_not_contains "hq-selfupdate: current core has no advisory" "$out" "hq-core-auto-update"
+rm -rf "$SELF_RECORDS"; rm -f "$SELF_DONE"
+out="$(FAKE_GH_AUTH=0 FAKE_GH_TAG=v2.0.0 FAKE_RECORD_DIR="$SELF_RECORDS" FAKE_OUTER_FORK_DONE="$SELF_DONE" run_selfupdate env)"
+assert_eq "hq-selfupdate: current core remains silent" "$out" ""
+wait_for_record "$SELF_DONE" && ok "hq-selfupdate: current core runs the detached body" || bad "hq-selfupdate: current core runs the detached body"
 assert_nofile "$SELF_RECORDS/rescue.log" "hq-selfupdate: current core schedules no rescue"
+# (g) A record-only outer fork proves that SessionStart never performs lookups.
+rm -f "$SELF_STATE/hq-selfupdate-last-check.json" "$SELF_STATE/hq-cli-auto-update.stamp" "$SELF_STATE/hq-core-rescue.stamp"
+rm -rf "$SELF_RECORDS"; rm -f "$SELF_FORKS" "$SELF_CALLS" "$SELF_DONE"
+SECONDS=0
+out="$(FAKE_HQ_CLI_VERSION=1.0.0 FAKE_NPM_VERSION=2.0.0 FAKE_GH_AUTH=0 FAKE_GH_TAG=v2.0.0 FAKE_RECORD_DIR="$SELF_RECORDS" FAKE_FORK_RECORD="$SELF_FORKS" FAKE_CALL_RECORD="$SELF_CALLS" FAKE_FORK_MODE=record-only FAKE_NETWORK_SLEEP=2 run_selfupdate env)"
+elapsed="$SECONDS"
+wait_for_record "$SELF_FORKS" && ok "hq-selfupdate: non-blocking path forks its background body" || bad "hq-selfupdate: non-blocking path forks its background body"
+assert_eq "hq-selfupdate: non-blocking path remains silent" "$out" ""
+assert_nofile "$SELF_CALLS" "hq-selfupdate: synchronous path makes zero network calls"
+[ "$elapsed" -lt 2 ] && ok "hq-selfupdate: record-only fork adds no blocking wait" || bad "hq-selfupdate: record-only fork adds no blocking wait" "elapsed ${elapsed}s"
 
 echo "== do-update rollback =="
 R2="$(new_root rollback)"; ST="$R2/workspace/.hq-pack-agent"; mkdir -p "$ST/repo/install"

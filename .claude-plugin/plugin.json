@@ -1,6 +1,6 @@
 {
   "name": "hq-agent",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Agent-only HQ behavior — hooks, policies, and skills that activate solely in genuine HQ agent sessions (Slack / email / cloud workers) and stay inert for human users. Self-updates from its own private GitHub release and keeps unattended boxes current with hq-cli and hq-core releases.",
   "author": {
     "name": "Indigo / HQ",
