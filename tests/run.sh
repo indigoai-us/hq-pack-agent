@@ -6,6 +6,8 @@
 #   * is-agent detection precedence (force flags, markers, default-inert)
 #   * updater: local<remote triggers; equal/greater does not; TTL throttle;
 #     cache-delete forces re-check
+#   * autonomous hq maintenance: agent-gated, throttled hq-cli update and
+#     detached hq rescue when hq-core is behind
 #   * auth: NO token still updates (public repo, unauthenticated); nothing-to-
 #     fetch is a graceful no-op; a token (when present) never leaks to output/log
 #   * rollback: a release whose install.sh fails rolls back to the prior version
@@ -50,11 +52,36 @@ esac
 EOF
   cat > "$bin/hq" <<'EOF'
 #!/bin/bash
-if [ "$1" = "secrets" ] && [ "$2" = "get" ]; then
-  [ -n "${FAKE_HQ_SECRET:-}" ] && { printf '%s\n' "$FAKE_HQ_SECRET"; exit 0; }
-  exit 0
-fi
-exit 1
+case "$1" in
+  secrets)
+    [ "$2" = "get" ] || exit 1
+    [ -n "${FAKE_HQ_SECRET:-}" ] && { printf '%s\n' "$FAKE_HQ_SECRET"; exit 0; }
+    exit 0
+    ;;
+  --version)
+    [ -n "${FAKE_HQ_CLI_VERSION:-}" ] && { printf 'hq %s\n' "$FAKE_HQ_CLI_VERSION"; exit 0; }
+    exit 1
+    ;;
+  rescue)
+    [ -n "${FAKE_RECORD_DIR:-}" ] && { mkdir -p "$FAKE_RECORD_DIR"; printf '%s\n' "$*" >> "$FAKE_RECORD_DIR/rescue.log"; }
+    exit 0
+    ;;
+  *) exit 1 ;;
+esac
+EOF
+  cat > "$bin/npm" <<'EOF'
+#!/bin/bash
+case "$1" in
+  view)
+    [ -n "${FAKE_NPM_VERSION:-}" ] && { printf '%s\n' "$FAKE_NPM_VERSION"; exit 0; }
+    exit 1
+    ;;
+  install)
+    [ -n "${FAKE_RECORD_DIR:-}" ] && { mkdir -p "$FAKE_RECORD_DIR"; printf '%s\n' "$*" >> "$FAKE_RECORD_DIR/npm-install.log"; }
+    exit 0
+    ;;
+  *) exit 1 ;;
+esac
 EOF
   # Hermetic curl: the updater's unauthenticated fallback hits GitHub's
   # releases/latest — stub it (mirrors the gh stub via FAKE_GH_TAG) so tests
@@ -66,7 +93,19 @@ case "$*" in
   *) exit 1 ;;
 esac
 EOF
-  chmod +x "$bin/gh" "$bin/hq" "$bin/curl"
+  chmod +x "$bin/gh" "$bin/hq" "$bin/npm" "$bin/curl"
+}
+
+# Detached children should record virtually immediately, but tolerate scheduler
+# variance without making the suite depend on a particular setsid implementation.
+wait_for_record() {
+  local f="$1" i=0
+  while [ "$i" -lt 20 ]; do
+    [ -s "$f" ] && return 0
+    sleep 0.05
+    i=$((i + 1))
+  done
+  return 1
 }
 
 echo "== is-agent detection =="
@@ -170,6 +209,54 @@ rm -f "$R1/workspace/.hq-pack-agent/last-check.json"
 FAKE_GH_AUTH=1 FAKE_GH_TAG=v0.1.0 run_updater env >/dev/null 2>&1
 assert_file "$R1/workspace/.hq-pack-agent/last-check.json" "updater: cache re-created after delete"
 
+echo "== agent-hq-selfupdate: detached autonomous maintenance =="
+R5="$(new_root hq-selfupdate)"; BIN5="$TMP/bin-hq-selfupdate"; make_stubs "$BIN5"
+SELF_STATE="$R5/workspace/.hq-pack-agent"
+SELF_RECORDS="$R5/records"
+run_selfupdate() { # env-configured; stdin closes immediately like a real SessionStart hook.
+  ( export PATH="$BIN5:$PATH" HQ_PACK_AGENT_HQ_ROOT="$R5" HQ_PACK_AGENT_FORCE_AGENT=1
+    "$@" bash "$PKG/hooks/agent-hq-selfupdate.sh" </dev/null 2>/dev/null )
+}
+# (a) Human sessions never initialize state, schedule work, or print anything.
+out="$(env PATH="$BIN5:$PATH" HQ_PACK_AGENT_HQ_ROOT="$R5" HQ_PACK_AGENT_FORCE_HUMAN=1 FAKE_HQ_CLI_VERSION=1.0.0 FAKE_NPM_VERSION=2.0.0 FAKE_RECORD_DIR="$SELF_RECORDS" bash "$PKG/hooks/agent-hq-selfupdate.sh" </dev/null 2>/dev/null)"
+assert_eq "hq-selfupdate: non-agent session is silent" "$out" ""
+assert_nofile "$SELF_STATE" "hq-selfupdate: non-agent session schedules no work"
+# (b) A fresh 24-hour cache stops all update checks before they begin.
+mkdir -p "$SELF_STATE"; printf '{"latest":"9.9.9"}\n' > "$SELF_STATE/hq-selfupdate-last-check.json"
+rm -rf "$SELF_RECORDS"
+out="$(FAKE_HQ_CLI_VERSION=1.0.0 FAKE_NPM_VERSION=2.0.0 FAKE_RECORD_DIR="$SELF_RECORDS" run_selfupdate env)"
+assert_eq "hq-selfupdate: fresh cache throttles silently" "$out" ""
+assert_nofile "$SELF_RECORDS/npm-install.log" "hq-selfupdate: fresh cache schedules no cli install"
+assert_nofile "$SELF_RECORDS/rescue.log" "hq-selfupdate: fresh cache schedules no rescue"
+# (c) An old CLI schedules a detached npm install and provides an advisory.
+rm -f "$SELF_STATE/hq-selfupdate-last-check.json" "$SELF_STATE/hq-cli-auto-update.stamp" "$SELF_STATE/hq-core-rescue.stamp"
+rm -rf "$SELF_RECORDS"
+out="$(FAKE_HQ_CLI_VERSION=1.0.0 FAKE_NPM_VERSION=2.0.0 FAKE_RECORD_DIR="$SELF_RECORDS" run_selfupdate env)"
+assert_contains "hq-selfupdate: old cli emits advisory" "$out" "hq-cli-auto-update"
+wait_for_record "$SELF_RECORDS/npm-install.log" && ok "hq-selfupdate: old cli schedules detached npm install" || bad "hq-selfupdate: old cli schedules detached npm install"
+assert_contains "hq-selfupdate: npm install targets latest cli" "$(cat "$SELF_RECORDS/npm-install.log" 2>/dev/null)" "install -g @indigoai-us/hq-cli@latest"
+# (d) An equal/current CLI never schedules another install.
+rm -f "$SELF_STATE/hq-selfupdate-last-check.json" "$SELF_STATE/hq-cli-auto-update.stamp"
+rm -rf "$SELF_RECORDS"
+out="$(FAKE_HQ_CLI_VERSION=2.0.0 FAKE_NPM_VERSION=2.0.0 FAKE_RECORD_DIR="$SELF_RECORDS" run_selfupdate env)"
+assert_not_contains "hq-selfupdate: current cli has no advisory" "$out" "hq-cli-auto-update"
+assert_nofile "$SELF_RECORDS/npm-install.log" "hq-selfupdate: current cli schedules no install"
+# (e) A newer public core release uses the curl fallback and schedules hq rescue.
+mkdir -p "$R5/core"; printf 'hqVersion: 1.0.0\n' > "$R5/core/core.yaml"
+rm -f "$SELF_STATE/hq-selfupdate-last-check.json" "$SELF_STATE/hq-core-rescue.stamp"
+rm -rf "$SELF_RECORDS"
+out="$(FAKE_GH_AUTH=0 FAKE_GH_TAG=v2.0.0 FAKE_RECORD_DIR="$SELF_RECORDS" run_selfupdate env)"
+assert_contains "hq-selfupdate: newer core emits advisory" "$out" "hq-core-auto-update"
+wait_for_record "$SELF_RECORDS/rescue.log" && ok "hq-selfupdate: newer core schedules detached rescue" || bad "hq-selfupdate: newer core schedules detached rescue"
+assert_contains "hq-selfupdate: rescue receives HQ root" "$(cat "$SELF_RECORDS/rescue.log" 2>/dev/null)" "rescue --hq-root $R5 --yes"
+# (f) Equal hq-core versions never schedule rescue.
+printf 'hqVersion: 2.0.0\n' > "$R5/core/core.yaml"
+rm -f "$SELF_STATE/hq-selfupdate-last-check.json" "$SELF_STATE/hq-core-rescue.stamp"
+rm -rf "$SELF_RECORDS"
+out="$(FAKE_GH_AUTH=0 FAKE_GH_TAG=v2.0.0 FAKE_RECORD_DIR="$SELF_RECORDS" run_selfupdate env)"
+assert_not_contains "hq-selfupdate: current core has no advisory" "$out" "hq-core-auto-update"
+assert_nofile "$SELF_RECORDS/rescue.log" "hq-selfupdate: current core schedules no rescue"
+
 echo "== do-update rollback =="
 R2="$(new_root rollback)"; ST="$R2/workspace/.hq-pack-agent"; mkdir -p "$ST/repo/install"
 printf '0.1.0\n' > "$ST/installed-version"
@@ -208,6 +295,7 @@ HQ_PACK_AGENT_HQ_ROOT="$R3" bash "$PKG/install/install.sh" >/dev/null 2>&1
 SECOND="$(cat "$R3/.claude/settings.local.json")"
 assert_eq "install is idempotent (identical settings twice)" "$SECOND" "$FIRST"
 assert_contains "install wired the gate into settings" "$FIRST" "agent-pack-gate.sh"
+assert_contains "install wired agent-hq-selfupdate into settings" "$FIRST" "agent-hq-selfupdate.sh"
 assert_contains "install wired agent-startwork into settings" "$FIRST" "agent-startwork.sh"
 HQ_PACK_AGENT_HQ_ROOT="$R3" bash "$PKG/install/uninstall.sh" >/dev/null 2>&1
 assert_nofile "$R3/.claude/settings.local.json" "uninstall: removes settings.local.json (byte-identical absence)"
@@ -367,6 +455,7 @@ HQ_PACK_AGENT_HQ_ROOT="$RW" bash "$PKG/install/install.sh" >/dev/null 2>&1
 SL="$RW/.claude/settings.local.json"
 ss_has() { jq -e --arg e "$1" --arg m "$2" --arg id "$3" '.hooks[$e][] | select(($m=="" ) or (.matcher==$m)) | .hooks[] | select((.command|contains("gate.sh\" "+$id+" ")) and (.command|endswith($id+".sh\"")))' "$SL" >/dev/null 2>&1; }
 ss_has SessionStart "" agent-slack-context && ok "wiring: SessionStart runs agent-slack-context" || bad "wiring: SessionStart agent-slack-context missing"
+ss_has SessionStart "" agent-hq-selfupdate && ok "wiring: SessionStart runs agent-hq-selfupdate" || bad "wiring: SessionStart agent-hq-selfupdate missing"
 ss_has SessionStart "" agent-startwork && ok "wiring: SessionStart runs agent-startwork" || bad "wiring: SessionStart agent-startwork missing"
 ss_has PreToolUse Read agent-company-file-access && ok "wiring: PreToolUse/Read runs agent-company-file-access" || bad "wiring: PreToolUse/Read agent-company-file-access missing"
 if grep -q 'agent-file-access\.sh' "$SL"; then bad "wiring: retired agent-file-access.sh must be absent"; else ok "wiring: retired PostToolUse agent-file-access absent"; fi
