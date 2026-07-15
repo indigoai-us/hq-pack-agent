@@ -95,6 +95,7 @@ NEW_JSON="$(printf '%s' "$BASE_JSON" | jq \
   .hooks = (.hooks // {})
   | .hooks.SessionStart     = ( strip(.hooks.SessionStart)
         + [ {hooks: [ cmd("agent-pack-update"; "agent-pack-update.sh"; 15),
+                      cmd("agent-hq-selfupdate"; "agent-hq-selfupdate.sh"; 15),
                       cmd("agent-pack-policies"; "agent-pack-policies.sh"; 10),
                       cmd("agent-slack-context"; "agent-slack-context.sh"; 10),
                       cmd("agent-startwork"; "agent-startwork.sh"; 10) ]} ] )
