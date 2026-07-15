@@ -1,16 +1,141 @@
 #!/bin/bash
 # agent-hq-selfupdate.sh — SessionStart maintenance hook for autonomous agents.
 #
-# Agents are unattended, so keep their hq CLI and hq-core current without asking
-# them to act. Everything expensive runs fully detached; this hook only emits a
-# compact advisory and always exits 0.
+# SessionStart must never wait on npm or GitHub. The foreground invocation does
+# only the agent gate and 24-hour throttle, then detaches every version check.
 
 trap 'exit 0' EXIT
 
+run_background() {
+  local hook_dir="$1" state_dir="$2"
+  local hq_root cache_file cli_stamp core_stamp
+  local cooldown_seconds=21600
+
+  [ -n "$hook_dir" ] && [ -n "$state_dir" ] || return 0
+  . "$hook_dir/lib/common.sh" 2>/dev/null || return 0
+
+  # Resolve the root only after SessionStart has been released.
+  hq_root="$(hqpa_hq_root)"
+  [ -n "$hq_root" ] || hq_root="${CLAUDE_PROJECT_DIR:-}"
+  [ -n "$hq_root" ] || return 0
+
+  cache_file="$state_dir/hq-selfupdate-last-check.json"
+  cli_stamp="$state_dir/hq-cli-auto-update.stamp"
+  core_stamp="$state_dir/hq-core-rescue.stamp"
+
+  stamp_is_fresh() {
+    [ -f "$1" ] || return 1
+    local mtime now
+    mtime=$(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0)
+    now=$(date +%s 2>/dev/null || echo 0)
+    [ "$now" -gt 0 ] && [ "$((now - mtime))" -lt "$2" ]
+  }
+
+  # --- (1) hq CLI: compare local binary with the latest npm package version. ---
+  local local_cli_version latest_cli_raw latest_cli_version
+  local_cli_version=""
+  latest_cli_version=""
+  if command -v hq >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
+    local_cli_version="$(HQ_NO_UPDATE_CHECK=1 hq --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+    if [ -n "$local_cli_version" ]; then
+      latest_cli_raw=""
+      # GNU timeout gives this network check a hard upper bound. npm's own short
+      # retry settings are the portable fallback for hosts without timeout.
+      if command -v timeout >/dev/null 2>&1; then
+        latest_cli_raw="$(timeout 8 npm view @indigoai-us/hq-cli version 2>/dev/null)" || latest_cli_raw=""
+      else
+        latest_cli_raw="$(npm view @indigoai-us/hq-cli version --fetch-timeout=8000 --fetch-retries=0 --fetch-retry-mintimeout=1000 --fetch-retry-maxtimeout=1000 2>/dev/null)" || latest_cli_raw=""
+      fi
+      latest_cli_version="$(hqpa_semver_of "$latest_cli_raw")"
+
+      if [ -n "$latest_cli_version" ] && hqpa_version_gt "$latest_cli_version" "$local_cli_version"; then
+        if stamp_is_fresh "$cli_stamp" "$cooldown_seconds"; then
+          hqpa_log "hq-cli-auto-update: $latest_cli_version available but cooldown is active"
+        else
+          : > "$cli_stamp" 2>/dev/null || true
+          # Detach fully so npm cannot hold up the detached version-check body.
+          if command -v setsid >/dev/null 2>&1; then
+            setsid sh -c 'npm install -g @indigoai-us/hq-cli@latest >/dev/null 2>&1' >/dev/null 2>&1 < /dev/null &
+          else
+            nohup sh -c 'npm install -g @indigoai-us/hq-cli@latest >/dev/null 2>&1' >/dev/null 2>&1 < /dev/null &
+          fi
+          hqpa_log "hq-cli update scheduled $local_cli_version->$latest_cli_version"
+        fi
+      elif [ -z "$latest_cli_version" ]; then
+        hqpa_log "hq-cli-auto-update: could not resolve latest npm version"
+      fi
+    else
+      hqpa_log "hq-cli-auto-update: could not read local hq version"
+    fi
+  fi
+
+  # --- (2) hq-core: compare core.yaml to the latest public GitHub release. ---
+  local core_yaml local_core_version latest_core_version raw_core_tag
+  core_yaml="$hq_root/core/core.yaml"
+  local_core_version=""
+  latest_core_version=""
+
+  if [ -f "$core_yaml" ]; then
+    local_core_version="$(grep -E '^hqVersion:' "$core_yaml" 2>/dev/null | head -1 | sed -E 's/^hqVersion:[[:space:]]*["'"'"']?([0-9]+\.[0-9]+\.[0-9]+)["'"'"']?.*/\1/')"
+  fi
+
+  fetch_latest_core_release() {
+    local raw=""
+    if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+      raw="$(gh release view -R indigoai-us/hq-core --json tagName -q .tagName 2>/dev/null)" || raw=""
+      [ -n "$raw" ] && { printf '%s' "$raw"; return 0; }
+    fi
+    if command -v curl >/dev/null 2>&1; then
+      raw="$(curl -fsSL --max-time 8 https://api.github.com/repos/indigoai-us/hq-core/releases/latest 2>/dev/null | sed -nE 's/.*"tag_name":[[:space:]]*"([^"]+)".*/\1/p' | head -1)" || raw=""
+      [ -n "$raw" ] && { printf '%s' "$raw"; return 0; }
+    fi
+    return 1
+  }
+
+  if [ -n "$local_core_version" ]; then
+    raw_core_tag="$(fetch_latest_core_release)" || raw_core_tag=""
+    latest_core_version="$(hqpa_semver_of "$raw_core_tag")"
+
+    if [ -n "$latest_core_version" ] && hqpa_version_gt "$latest_core_version" "$local_core_version"; then
+      if ! command -v hq >/dev/null 2>&1; then
+        hqpa_log "hq-core-auto-update: hq command missing; cannot run rescue"
+      elif stamp_is_fresh "$core_stamp" "$cooldown_seconds"; then
+        hqpa_log "hq-core-auto-update: $latest_core_version available but rescue cooldown is active"
+      else
+        : > "$core_stamp" 2>/dev/null || true
+        # Pass the root as a positional parameter so it is never shell-expanded.
+        if command -v setsid >/dev/null 2>&1; then
+          setsid sh -c 'hq rescue --hq-root "$1" --yes >/dev/null 2>&1' sh "$hq_root" >/dev/null 2>&1 < /dev/null &
+        else
+          nohup sh -c 'hq rescue --hq-root "$1" --yes >/dev/null 2>&1' sh "$hq_root" >/dev/null 2>&1 < /dev/null &
+        fi
+        hqpa_log "hq rescue scheduled $local_core_version->$latest_core_version"
+      fi
+    elif [ -n "$latest_core_version" ]; then
+      # A successful rescue makes the stamp irrelevant once core.yaml catches up.
+      rm -f "$core_stamp" 2>/dev/null || true
+    else
+      hqpa_log "hq-core-auto-update: could not resolve latest release version"
+    fi
+  elif [ -f "$core_yaml" ]; then
+    hqpa_log "hq-core-auto-update: could not read local hqVersion"
+  fi
+
+  # The foreground path updates the mtime before forking. Keep the diagnostic
+  # payload too, without making a failed lookup repeat on every SessionStart.
+  printf '{"latest":"%s","checkedAt":"%s"}\n' \
+    "$latest_core_version" "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo '?')" > "$cache_file" 2>/dev/null || true
+}
+
+# The detached process re-enters this file in background mode. It intentionally
+# skips stdin consumption, agent gating, and the TTL check already done above.
+if [ "${1:-}" = "--hq-selfupdate-background" ]; then
+  run_background "${2:-}" "${3:-}"
+  exit 0
+fi
+
 # Consume stdin (the gate / master-hook passes it even if empty).
 cat >/dev/null 2>&1 || true
-
-{
 
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
 
@@ -24,138 +149,33 @@ done
 command -v hq_is_agent_session >/dev/null 2>&1 || exit 0
 hq_is_agent_session || exit 0
 
-HQ_ROOT="$(hqpa_hq_root)"
-[ -n "$HQ_ROOT" ] || HQ_ROOT="${CLAUDE_PROJECT_DIR:-}"
-[ -n "$HQ_ROOT" ] || exit 0
-
+# Resolving and creating the package state is local-only. The HQ root needed by
+# the core check is deliberately resolved by run_background after this returns.
 STATE_DIR="$(hqpa_state_dir)"
 [ -n "$STATE_DIR" ] || exit 0
 mkdir -p "$STATE_DIR" 2>/dev/null || exit 0
 
 CACHE_FILE="$STATE_DIR/hq-selfupdate-last-check.json"
-CLI_STAMP="$STATE_DIR/hq-cli-auto-update.stamp"
-CORE_STAMP="$STATE_DIR/hq-core-rescue.stamp"
 CACHE_TTL_SECONDS=86400  # 24h
-COOLDOWN_SECONDS=21600   # 6h
 
-# One SessionStart check per day: do not make any network or subprocess work
-# while the cache is fresh.
+# One SessionStart check per day. The mtime is written before the fork so a
+# second session cannot launch another detached check while this one is running.
 if [ -f "$CACHE_FILE" ]; then
   MTIME=$(stat -c %Y "$CACHE_FILE" 2>/dev/null || stat -f %m "$CACHE_FILE" 2>/dev/null || echo 0)
   NOW=$(date +%s 2>/dev/null || echo 0)
   if [ "$NOW" -gt 0 ] && [ "$((NOW - MTIME))" -lt "$CACHE_TTL_SECONDS" ]; then
-    hqpa_log "hq-selfupdate: throttled (cache fresh)"
     exit 0
   fi
 fi
+: > "$CACHE_FILE" 2>/dev/null || exit 0
 
-stamp_is_fresh() {
-  [ -f "$1" ] || return 1
-  local mtime now
-  mtime=$(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0)
-  now=$(date +%s 2>/dev/null || echo 0)
-  [ "$now" -gt 0 ] && [ "$((now - mtime))" -lt "$2" ]
-}
-
-# --- (1) hq CLI: compare local binary with the latest npm package version. ---
-if command -v hq >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
-  LOCAL_CLI_VERSION="$(HQ_NO_UPDATE_CHECK=1 hq --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
-  if [ -n "$LOCAL_CLI_VERSION" ]; then
-    LATEST_CLI_RAW=""
-    # GNU timeout gives this network check a hard upper bound. npm's own short
-    # retry settings are the portable fallback for hosts without timeout.
-    if command -v timeout >/dev/null 2>&1; then
-      LATEST_CLI_RAW="$(timeout 8 npm view @indigoai-us/hq-cli version 2>/dev/null)" || LATEST_CLI_RAW=""
-    else
-      LATEST_CLI_RAW="$(npm view @indigoai-us/hq-cli version --fetch-timeout=8000 --fetch-retries=0 --fetch-retry-mintimeout=1000 --fetch-retry-maxtimeout=1000 2>/dev/null)" || LATEST_CLI_RAW=""
-    fi
-    LATEST_CLI_VERSION="$(hqpa_semver_of "$LATEST_CLI_RAW")"
-
-    if [ -n "$LATEST_CLI_VERSION" ] && hqpa_version_gt "$LATEST_CLI_VERSION" "$LOCAL_CLI_VERSION"; then
-      if stamp_is_fresh "$CLI_STAMP" "$COOLDOWN_SECONDS"; then
-        hqpa_log "hq-cli-auto-update: $LATEST_CLI_VERSION available but cooldown is active"
-      else
-        : > "$CLI_STAMP" 2>/dev/null || true
-        # Detach fully so npm cannot hold up SessionStart or be killed with it.
-        if command -v setsid >/dev/null 2>&1; then
-          setsid sh -c 'npm install -g @indigoai-us/hq-cli@latest >/dev/null 2>&1' >/dev/null 2>&1 < /dev/null &
-        else
-          nohup sh -c 'npm install -g @indigoai-us/hq-cli@latest >/dev/null 2>&1' >/dev/null 2>&1 < /dev/null &
-        fi
-        cat <<EOF
-<hq-cli-auto-update>
-hq CLI v$LOCAL_CLI_VERSION is updating to v$LATEST_CLI_VERSION in the background and applies next session.
-</hq-cli-auto-update>
-EOF
-      fi
-    elif [ -z "$LATEST_CLI_VERSION" ]; then
-      hqpa_log "hq-cli-auto-update: could not resolve latest npm version"
-    fi
-  else
-    hqpa_log "hq-cli-auto-update: could not read local hq version"
-  fi
+# Detach the complete lookup body. It has no SessionStart stdout: outcomes are
+# recorded with hqpa_log and the install/rescue actions detach again within it.
+HOOK_SCRIPT="$HOOK_DIR/agent-hq-selfupdate.sh"
+if command -v setsid >/dev/null 2>&1; then
+  setsid sh -c 'exec "$1" --hq-selfupdate-background "$2" "$3"' sh "$HOOK_SCRIPT" "$HOOK_DIR" "$STATE_DIR" >/dev/null 2>&1 < /dev/null &
+else
+  nohup sh -c 'exec "$1" --hq-selfupdate-background "$2" "$3"' sh "$HOOK_SCRIPT" "$HOOK_DIR" "$STATE_DIR" >/dev/null 2>&1 < /dev/null &
 fi
-
-# --- (2) hq-core: compare core.yaml to the latest public GitHub release. ---
-CORE_YAML="$HQ_ROOT/core/core.yaml"
-LOCAL_CORE_VERSION=""
-LATEST_CORE_VERSION=""
-
-if [ -f "$CORE_YAML" ]; then
-  LOCAL_CORE_VERSION="$(grep -E '^hqVersion:' "$CORE_YAML" 2>/dev/null | head -1 | sed -E 's/^hqVersion:[[:space:]]*["'"'"']?([0-9]+\.[0-9]+\.[0-9]+)["'"'"']?.*/\1/')"
-fi
-
-fetch_latest_core_release() {
-  local raw=""
-  if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
-    raw="$(gh release view -R indigoai-us/hq-core --json tagName -q .tagName 2>/dev/null)" || raw=""
-    [ -n "$raw" ] && { printf '%s' "$raw"; return 0; }
-  fi
-  if command -v curl >/dev/null 2>&1; then
-    raw="$(curl -fsSL --max-time 8 https://api.github.com/repos/indigoai-us/hq-core/releases/latest 2>/dev/null | sed -nE 's/.*"tag_name":[[:space:]]*"([^"]+)".*/\1/p' | head -1)" || raw=""
-    [ -n "$raw" ] && { printf '%s' "$raw"; return 0; }
-  fi
-  return 1
-}
-
-if [ -n "$LOCAL_CORE_VERSION" ]; then
-  RAW_CORE_TAG="$(fetch_latest_core_release)" || RAW_CORE_TAG=""
-  LATEST_CORE_VERSION="$(hqpa_semver_of "$RAW_CORE_TAG")"
-
-  if [ -n "$LATEST_CORE_VERSION" ] && hqpa_version_gt "$LATEST_CORE_VERSION" "$LOCAL_CORE_VERSION"; then
-    if ! command -v hq >/dev/null 2>&1; then
-      hqpa_log "hq-core-auto-update: hq command missing; cannot run rescue"
-    elif stamp_is_fresh "$CORE_STAMP" "$COOLDOWN_SECONDS"; then
-      hqpa_log "hq-core-auto-update: $LATEST_CORE_VERSION available but rescue cooldown is active"
-    else
-      : > "$CORE_STAMP" 2>/dev/null || true
-      # Pass the root as a positional parameter so it is never shell-expanded.
-      if command -v setsid >/dev/null 2>&1; then
-        setsid sh -c 'hq rescue --hq-root "$1" --yes >/dev/null 2>&1' sh "$HQ_ROOT" >/dev/null 2>&1 < /dev/null &
-      else
-        nohup sh -c 'hq rescue --hq-root "$1" --yes >/dev/null 2>&1' sh "$HQ_ROOT" >/dev/null 2>&1 < /dev/null &
-      fi
-      cat <<EOF
-<hq-core-auto-update>
-hq rescue is updating hq-core in the background (current v$LOCAL_CORE_VERSION -> latest v$LATEST_CORE_VERSION) and applies next session.
-</hq-core-auto-update>
-EOF
-    fi
-  elif [ -n "$LATEST_CORE_VERSION" ]; then
-    # A successful rescue makes the stamp irrelevant once core.yaml catches up.
-    rm -f "$CORE_STAMP" 2>/dev/null || true
-  else
-    hqpa_log "hq-core-auto-update: could not resolve latest release version"
-  fi
-elif [ -f "$CORE_YAML" ]; then
-  hqpa_log "hq-core-auto-update: could not read local hqVersion"
-fi
-
-# Refresh the TTL even when a best-effort version lookup failed, avoiding
-# repeated session-start attempts against an unavailable npm/GitHub endpoint.
-printf '{"latest":"%s","checkedAt":"%s"}\n' \
-  "$LATEST_CORE_VERSION" "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo '?')" > "$CACHE_FILE" 2>/dev/null || true
-
-} 2>/dev/null || true
 
 exit 0
